@@ -832,7 +832,29 @@ const NewsItem = ({ time, content, sentiment, onShowDetail }) => {
       {isNeg && <div className="absolute left-0 top-0 bottom-0 w-1 bg-danger/40" />}
       <div className="flex justify-between items-start mb-2">
         <div className="flex items-center gap-2">
-          <span className="text-[10px] font-mono text-gray-500">{time}</span>
+          <span className="text-[10px] font-mono text-gray-500">
+            {(() => {
+              const timeStr = time || '';
+              // 如果是完整日期时间格式（包含日期），格式化显示
+              if (timeStr.includes('-') && timeStr.includes(':')) {
+                try {
+                  const date = new Date(timeStr);
+                  const today = new Date();
+                  const isToday = date.toDateString() === today.toDateString();
+                  if (isToday) {
+                    // 今天的新闻只显示时间
+                    return date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+                  } else {
+                    // 非今天的新闻显示日期和时间
+                    return date.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false });
+                  }
+                } catch {
+                  return timeStr;
+                }
+              }
+              return timeStr;
+            })()}
+          </span>
           {sentiment?.sector && <span className="text-[9px] font-black text-primary/60 uppercase">{sentiment.sector}</span>}
         </div>
         {sentiment && (
