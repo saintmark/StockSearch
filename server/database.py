@@ -23,7 +23,13 @@ class DatabaseManager:
         self.init_db()
 
     def get_connection(self):
-        conn = sqlite3.connect(DB_PATH, timeout=30) # 增加超时时间防止锁死
+        conn = sqlite3.connect(DB_PATH, timeout=60) # 增加到 60s 超时
+        # 启用 WAL 模式提升并发性能
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+        except:
+            pass
         return conn
 
     def init_db(self):
@@ -405,27 +411,36 @@ class DatabaseManager:
         conn = self.get_connection()
         try:
             cursor = conn.cursor()
-            current_date = datetime.now().date()
+            # 统一使用北京时间 (UTC+8)
+            beijing_now = datetime.utcnow() + timedelta(hours=8)
+            current_date = beijing_now.date()
+            current_year = beijing_now.year
             week_start = self.get_week_start_date()
-                
+                    
             # 用于累积本批次的情绪值，最后统一更新数据库，减少 IO
             sentiment_updates = {} # {industry: {'score_sum': float, 'count': int}}
-    
+        
             import hashlib
             for item in news_list:
                 # 生成唯一主键：标题 + 发布时间
                 raw_time = item.get('time', '')
                 if raw_time is None: raw_time = ""
-                # 强转为字符串，防止 datetime.time 类型导致 sqlite 报错
-                publish_time_str = str(raw_time)
-                            
-                # 如果时间只有时间没有日期（格式如 "14:30:00"），添加当前日期
-                if ':' in publish_time_str and len(publish_time_str.split(':')) >= 2:
-                    # 检查是否只有时间（长度 <= 8，如 "14:30:00"）
-                    if len(publish_time_str) <= 8 and '-' not in publish_time_str:
-                        # 只有时间，添加当前日期
+                publish_time_str = str(raw_time).strip()
+                        
+                # 智能补全日期格式
+                if publish_time_str:
+                    # 情况 1: 只有时间 "HH:MM:SS" 或 "HH:MM"
+                    if ':' in publish_time_str and len(publish_time_str) <= 8 and '-' not in publish_time_str:
                         publish_time_str = f"{current_date.strftime('%Y-%m-%d')} {publish_time_str}"
                             
+                    # 情况 2: 只有月日 "MM-DD HH:MM"
+                    elif publish_time_str.count('-') == 1 and publish_time_str.find('-') < 5:
+                        publish_time_str = f"{current_year}-{publish_time_str}"
+                            
+                    # 情况 3: 只有月日但用斜杠 "MM/DD HH:MM"
+                    elif publish_time_str.count('/') == 1 and publish_time_str.find('/') < 5:
+                        publish_time_str = f"{current_year}-{publish_time_str.replace('/', '-')}"
+                        
                 unique_str = f"{item.get('title', '')}_{publish_time_str}"
                 # 使用 md5 生成稳定的哈希值，避免 Python hash() 随进程重启而变化
                 title_hash = hashlib.md5(unique_str.encode('utf-8')).hexdigest() 
@@ -503,19 +518,16 @@ class DatabaseManager:
 
     def get_latest_news(self, limit: int = 20, max_age_days: int = 3):
         """
-        获取最新已分析的新闻（按创建时间降序，最新的在最前面）
-        
-        Args:
-            limit: 返回的最大新闻数量
-            max_age_days: 新闻最大保留天数（默认3天），超过此天数的新闻将被过滤
+        获取最新已分析的新闻（增强排序稳定性）
         """
         conn = self.get_connection()
         try:
             cursor = conn.cursor()
-            # 使用 created_at 排序，因为它是 TIMESTAMP 类型，可以正确按时间排序
-            # 如果 publish_time 包含完整日期时间，也可以尝试使用它，但为了保险起见使用 created_at
-            # 添加时间过滤：只获取最近 max_age_days 天的新闻
-            cutoff_date = datetime.now() - timedelta(days=max_age_days)
+            # 统一使用北京时间计算截止日期
+            beijing_now = datetime.utcnow() + timedelta(hours=8)
+            cutoff_date = beijing_now - timedelta(days=max_age_days)
+            
+            # 先按创建时间取最近的，保证数据范围正确
             cursor.execute("""
                 SELECT title, content, publish_time, sentiment_json, created_at 
                 FROM news_analysis 
@@ -526,60 +538,56 @@ class DatabaseManager:
             rows = cursor.fetchall()
             
             result = []
+            current_year = beijing_now.year
             for row in rows:
                 try:
                     sentiment = json.loads(row[3])
                 except:
                     sentiment = {}
                 
-                # 确保时间格式包含日期（如果只有时间，使用 created_at 的日期）
-                publish_time = row[2] or ""
+                publish_time = str(row[2] or "").strip()
                 created_at = row[4]
                 
-                # 如果 publish_time 只有时间没有日期，使用 created_at 的日期
+                # 归一化处理：确保所有返回的时间都带有正确的年份 YYYY-MM-DD
                 if publish_time:
-                    publish_time_str = str(publish_time).strip()
-                    # 检查是否只有时间（格式如 "19:34:12" 或 "19:34"）
-                    if ':' in publish_time_str and len(publish_time_str.split(':')) >= 2:
-                        # 检查是否包含日期（包含 '-' 且长度 > 10）
-                        if len(publish_time_str) <= 8 or '-' not in publish_time_str:
-                            # 只有时间，使用 created_at 的日期
-                            if created_at:
-                                try:
-                                    if isinstance(created_at, str):
-                                        # 尝试多种日期格式
-                                        try:
-                                            created_dt = datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S")
-                                        except:
-                                            try:
-                                                created_dt = datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S.%f")
-                                            except:
-                                                created_dt = datetime.now()
-                                    else:
-                                        created_dt = created_at
-                                    publish_time = f"{created_dt.strftime('%Y-%m-%d')} {publish_time_str}"
-                                except Exception as e:
-                                    # 如果解析失败，使用当前日期
-                                    publish_time = f"{datetime.now().strftime('%Y-%m-%d')} {publish_time_str}"
-                            else:
-                                # 没有 created_at，使用当前日期
-                                publish_time = f"{datetime.now().strftime('%Y-%m-%d')} {publish_time_str}"
+                    # 如果没有年份 (MM-DD 或 HH:MM)
+                    if publish_time.count('-') == 1 and publish_time.find('-') < 5:
+                        publish_time = f"{current_year}-{publish_time}"
+                    elif ':' in publish_time and '-' not in publish_time:
+                        # 只有时间，补全创建时的日期
+                        try:
+                            c_date = datetime.strptime(created_at.split()[0], "%Y-%m-%d")
+                            publish_time = f"{c_date.strftime('%Y-%m-%d')} {publish_time}"
+                        except:
+                            publish_time = f"{beijing_now.strftime('%Y-%m-%d')} {publish_time}"
                 
                 result.append({
                     "title": row[0],
                     "content": row[1],
                     "time": publish_time,
                     "sentiment": sentiment,
-                    "created_at": row[4]  # 添加创建时间，用于进一步的时间衰减计算
+                    "created_at": created_at
                 })
+            
+            # 在返回前，进行一次基于规范化日期的时间戳排序
+            def parse_to_ts(item):
+                try:
+                    t_str = item['time']
+                    if len(t_str) <= 10: t_str += " 00:00:00"
+                    return datetime.strptime(t_str, "%Y-%m-%d %H:%M:%S").timestamp()
+                except:
+                    return 0
+
+            result.sort(key=parse_to_ts, reverse=True)
             return result
         finally:
             conn.close()
     
     def get_week_start_date(self, date_obj=None):
-        """获取指定日期所在周的开始日期（周一）"""
+        """获取指定日期所在周的开始日期（周一） - 使用北京时间"""
         if date_obj is None:
-            date_obj = datetime.now().date()
+            # 统一使用北京时间
+            date_obj = (datetime.utcnow() + timedelta(hours=8)).date()
         if isinstance(date_obj, str):
             date_obj = datetime.strptime(date_obj, "%Y-%m-%d").date()
         

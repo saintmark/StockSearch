@@ -233,23 +233,45 @@ class BackgroundScanner:
                 
                 def process_stock(symbol):
                     try:
+                        # 稳压：增加微小随机延迟，防止并发请求过快被数据源封锁
+                        import random
+                        time.sleep(0.1 + random.random() * 0.3)
+                
+                        # 1. 尝试从缓存或网络获取日线 (核心必需)
                         kline = self.db.get_cached_kline(symbol)
                         if kline is None:
                             kline = self.fetcher.get_kline_data(symbol, days=150)
-                            if not kline.empty:
+                            if kline is not None and not kline.empty:
                                 self.db.save_kline(symbol, kline)
-                        if kline.empty: return None
                                         
+                        if kline is None or kline.empty: 
+                            return None
+                                        
+                        # 2. 快速过滤：先进行简单的技术面预判
+                        # 如果技术得分极低，说明该股处于深跌或横盘，不值得进一步抓取周线和财务数据
+                        temp_rec = self.engine.generate_recommendation(kline, sentiment_score=0.0)
+                        if temp_rec.get('action') == 'WAIT' and temp_rec.get('score', 0) < 40:
+                            # 即使是 WAIT，也返回结果以便入库排序，但节省了 2 次昂贵的网络请求
+                            stock_info = self.db.get_cached_stock_info(symbol)
+                            temp_rec.update({
+                                'symbol': symbol,
+                                'name': stock_info.get('股票简称', symbol) if stock_info else symbol,
+                                'price': float(temp_rec.get('price', 0)),
+                                'industry': stock_info.get('行业', '未知') if stock_info else '未知'
+                            })
+                            return temp_rec
+                
+                        # 3. 只有“潜力股”才进行深度抓取 (周线 + 财务)
                         stock_info = self.db.get_cached_stock_info(symbol)
                         if not stock_info:
                             stock_info = self.fetcher.get_stock_info(symbol)
                             if stock_info:
                                 self.db.save_stock_info(symbol, stock_info)
                                         
-                        stock_name = stock_info.get('股票简称', symbol)
-                        stock_industry = stock_info.get('行业', '未知')
+                        stock_name = stock_info.get('股票简称', symbol) if stock_info else symbol
+                        stock_industry = stock_info.get('行业', '未知') if stock_info else '未知'
                                         
-                        # 获取多维数据
+                        # 获取深度维度数据
                         weekly_kline = None
                         try:
                             weekly_kline = self.fetcher.get_kline_data(symbol, period="weekly", days=200)
@@ -261,7 +283,7 @@ class BackgroundScanner:
                             if finance_list: finance_data = finance_list[0]
                         except: pass
                                         
-                        # 情感匹配
+                        # 情感匹配 (基于已有的 news_pool)
                         dynamic_sent = 0.0
                         if news_pool:
                             matching_news = industry_matcher.get_matching_news(
@@ -274,7 +296,7 @@ class BackgroundScanner:
                                 )
                                 dynamic_sent = max(-1.0, min(1.0, dynamic_sent))
                 
-                        # 生成推荐
+                        # 4. 生成最终深度推荐
                         rec = self.engine.generate_recommendation(
                             kline, dynamic_sent,
                             tech_weight=weights.get('tech_weight', 0.6),
@@ -290,8 +312,8 @@ class BackgroundScanner:
                             'name': stock_name,
                             'price': float(rec.get('price', 0)),
                             'industry': stock_industry,
-                            'change': float(stock_info.get('涨跌幅', 0)),
-                            'turnover': float(stock_info.get('换手率', 0))
+                            'change': float(stock_info.get('涨跌幅', 0)) if stock_info else 0.0,
+                            'turnover': float(stock_info.get('换手率', 0)) if stock_info else 0.0
                         })
                                         
                         if rec['action'] in ["BUY", "HOLD"]:
