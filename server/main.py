@@ -83,12 +83,23 @@ class NewsScanner:
                 news_pool = self.analyzer.batch_analyze(processed_news_input)
                 
                 # 3. 持久化到数据库
+                # 在保存前，确保时间包含日期
+                current_date = datetime.datetime.now().date()
                 news_to_save = []
                 for item in news_pool:
+                    publish_time = item.get("发布时间", "")
+                    # 如果时间只有时间没有日期，添加当前日期
+                    if publish_time:
+                        publish_time_str = str(publish_time)
+                        if ':' in publish_time_str and len(publish_time_str.split(':')) >= 2:
+                            if len(publish_time_str) <= 8 and '-' not in publish_time_str:
+                                # 只有时间，添加当前日期
+                                publish_time = f"{current_date} {publish_time_str}"
+                    
                     news_to_save.append({
                         "title": item.get("标题"),
                         "content": item.get("内容"),
-                        "time": item.get("发布时间"),
+                        "time": publish_time,
                         "sentiment": item.get("sentiment")
                     })
                 self.db.save_news_batch(news_to_save)
@@ -408,12 +419,25 @@ def get_news_flash():
         if "time" in news_df.columns and not news_df.empty:
             # 尝试将时间转换为 datetime 进行排序
             try:
+                current_date = datetime.datetime.now().date()
+                # 如果时间只有时间没有日期，添加当前日期
+                def add_date_if_needed(time_str):
+                    if pd.isna(time_str) or not time_str:
+                        return None
+                    time_str = str(time_str)
+                    # 如果只有时间（长度 <= 8，如 "14:30:00"），添加当前日期
+                    if ':' in time_str and len(time_str) <= 8 and '-' not in time_str:
+                        return f"{current_date} {time_str}"
+                    return time_str
+                
+                news_df['time'] = news_df['time'].apply(add_date_if_needed)
                 news_df['time'] = pd.to_datetime(news_df['time'], errors='coerce')
                 news_df = news_df.sort_values('time', ascending=False)
-                # 转换回字符串格式以便返回
-                news_df['time'] = news_df['time'].dt.strftime('%H:%M:%S')
-            except:
-                # 如果转换失败，按字符串降序排序（假设格式是 HH:MM:SS）
+                # 转换回字符串格式以便返回（包含完整日期时间）
+                news_df['time'] = news_df['time'].dt.strftime('%Y-%m-%d %H:%M:%S')
+            except Exception as e:
+                print(f"[News] Error processing time: {e}")
+                # 如果转换失败，按字符串降序排序
                 news_df = news_df.sort_values('time', ascending=False)
         
         news_list = news_df.head(20).to_dict(orient="records")

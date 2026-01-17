@@ -859,7 +859,29 @@ const NewsDetailedCard = ({ item, onShowDetail }) => {
       <div className="flex items-center justify-between mb-4">
         <div className="flex items-center gap-3">
           <div className={`w-3 h-3 rounded-full ${isPos ? 'bg-success shadow-[0_0_10px_#10b981]' : isNeg ? 'bg-danger shadow-[0_0_10px_#ef4444]' : 'bg-gray-600'}`} />
-          <span className="text-sm font-black text-gray-400 font-mono italic">{item.时间 || item.time}</span>
+          <span className="text-sm font-black text-gray-400 font-mono italic">
+            {(() => {
+              const timeStr = item.时间 || item.time || '';
+              // 如果是完整日期时间格式（包含日期），格式化显示
+              if (timeStr.includes('-') && timeStr.includes(':')) {
+                try {
+                  const date = new Date(timeStr);
+                  const today = new Date();
+                  const isToday = date.toDateString() === today.toDateString();
+                  if (isToday) {
+                    // 今天的新闻只显示时间
+                    return date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+                  } else {
+                    // 非今天的新闻显示日期和时间
+                    return date.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false });
+                  }
+                } catch {
+                  return timeStr;
+                }
+              }
+              return timeStr;
+            })()}
+          </span>
           {item.sentiment?.sector && (
             <span className="px-2 py-0.5 bg-gray-800 text-gray-500 text-[10px] font-black rounded border border-gray-700 uppercase tracking-widest">
               {item.sentiment.sector}

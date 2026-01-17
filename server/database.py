@@ -384,12 +384,21 @@ class DatabaseManager:
         conn = self.get_connection()
         try:
             cursor = conn.cursor()
+            current_date = datetime.now().date()
             for item in news_list:
                 # 生成唯一主键：标题 + 发布时间
                 raw_time = item.get('time', '')
                 if raw_time is None: raw_time = ""
                 # 强转为字符串，防止 datetime.time 类型导致 sqlite 报错
                 publish_time_str = str(raw_time)
+                
+                # 如果时间只有时间没有日期（格式如 "14:30:00"），添加当前日期
+                if ':' in publish_time_str and len(publish_time_str.split(':')) >= 2:
+                    # 检查是否只有时间（长度 <= 8，如 "14:30:00"）
+                    if len(publish_time_str) <= 8 and '-' not in publish_time_str:
+                        # 只有时间，添加当前日期
+                        publish_time_str = f"{current_date.strftime('%Y-%m-%d')} {publish_time_str}"
+                    # 如果已经是完整日期时间格式，保持不变
                 
                 unique_str = f"{item.get('title', '')}_{publish_time_str}"
                 title_hash = str(hash(unique_str)) 
@@ -448,10 +457,29 @@ class DatabaseManager:
                 except:
                     sentiment = {}
                 
+                # 确保时间格式包含日期（如果只有时间，使用 created_at 的日期）
+                publish_time = row[2] or ""
+                created_at = row[4]
+                
+                # 如果 publish_time 只有时间没有日期，使用 created_at 的日期
+                if publish_time and ':' in publish_time and len(publish_time.split(':')) >= 2:
+                    if len(publish_time) <= 8 and '-' not in publish_time:
+                        # 只有时间，使用 created_at 的日期
+                        if created_at:
+                            try:
+                                if isinstance(created_at, str):
+                                    created_dt = datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S")
+                                else:
+                                    created_dt = created_at
+                                publish_time = f"{created_dt.strftime('%Y-%m-%d')} {publish_time}"
+                            except:
+                                # 如果解析失败，使用当前日期
+                                publish_time = f"{datetime.now().strftime('%Y-%m-%d')} {publish_time}"
+                
                 result.append({
                     "title": row[0],
                     "content": row[1],
-                    "time": row[2],
+                    "time": publish_time,
                     "sentiment": sentiment,
                     "created_at": row[4]  # 添加创建时间，用于进一步的时间衰减计算
                 })
