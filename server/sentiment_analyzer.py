@@ -101,7 +101,7 @@ class SentimentAnalyzer:
         # 但我们在 LLMClient 里加了 retry 和 simple backoff
         results = [None] * len(news_list)
         
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             future_to_index = {}
             for i, item in enumerate(news_list):
                 content = item.get('内容') or item.get('content') or ""

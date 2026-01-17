@@ -57,34 +57,55 @@ class NewsScanner:
         print("[NewsScanner] Background News Scanner Thread Started.")
         while self.is_running:
             try:
-                # 1. 拉取全局快讯
+                # 1. 拉取全局快讯 (考虑到 Railway 海外 IP 访问限制，尝试多个源)
                 import akshare as ak
                 # print("[NewsScanner] Fetching latest global news...")
-                news_df = ak.stock_info_global_cls()
+                news_df = None
+                
+                # 尝试源 1: 全球快讯
+                try:
+                    news_df = ak.stock_info_global_cls()
+                except Exception as e:
+                    print(f"[NewsScanner] Source 1 (global_cls) failed: {e}")
+
+                # 尝试源 2: 财联社电报 (作为备选)
+                if news_df is None or news_df.empty:
+                    try:
+                        print("[NewsScanner] Source 1 empty, trying Source 2 (stock_telegraph_cls)...")
+                        news_df = ak.stock_telegraph_cls()
+                    except Exception as e:
+                        print(f"[NewsScanner] Source 2 (telegraph_cls) failed: {e}")
                 
                 # Check 
                 if news_df is None or news_df.empty:
-                    print("[NewsScanner] No news fetched via akshare.")
+                    print("[NewsScanner] No news fetched via any akshare sources. Retrying in 5 mins.")
                     time.sleep(300)
                     continue
 
-                news_list_raw = news_df.head(40).to_dict(orient="records")
+                print(f"[NewsScanner] Successfully fetched {len(news_df)} news items. Starting NLP analysis...")
+                news_list_raw = news_df.head(30).to_dict(orient="records") # 减少单次分析数量，提高响应速度
                 
                 processed_news_input = []
                 for n in news_list_raw:
-                    processed_news_input.append({
-                        "内容": n.get("内容"),
-                        "发布时间": n.get("发布时间"),
-                        "标题": n.get("标题")
-                    })
+                    content = n.get("内容") or n.get("content") or ""
+                    publish_time = n.get("发布时间") or n.get("time") or ""
+                    title = n.get("标题") or n.get("title") or ""
+                    if content:
+                        processed_news_input.append({
+                            "内容": content,
+                            "发布时间": publish_time,
+                            "标题": title
+                        })
                 
                 # 2. 调用 Analyzer 进行并发分析 (支持 LLM)
-                # print(f"[NewsScanner] Analyzing {len(processed_news_input)} items...")
                 news_pool = self.analyzer.batch_analyze(processed_news_input)
                 
                 # 3. 持久化到数据库
-                # 在保存前，确保时间包含日期
-                current_date = datetime.datetime.now().date()
+                # 修正：Railway 容器通常是 UTC 时间，需转换为北京时间（UTC+8）
+                utc_now = datetime.datetime.utcnow()
+                beijing_now = utc_now + datetime.timedelta(hours=8)
+                current_date = beijing_now.date()
+                
                 news_to_save = []
                 for item in news_pool:
                     publish_time = item.get("发布时间", "")
@@ -102,8 +123,10 @@ class NewsScanner:
                         "time": publish_time,
                         "sentiment": item.get("sentiment")
                     })
-                self.db.save_news_batch(news_to_save)
-                print(f"[NewsScanner] {len(news_to_save)} news items synced to DB.")
+                
+                if news_to_save:
+                    self.db.save_news_batch(news_to_save)
+                    print(f"[NewsScanner] {len(news_to_save)} news items synced to DB at {beijing_now.strftime('%H:%M:%S')} (CN Time).")
                 
                 # 定期清理过期新闻（每24小时一次）
                 current_time = time.time()
@@ -152,10 +175,11 @@ class BackgroundScanner:
         print("[Scanner] Background Full-Market Scanner Thread Started.")
         while self.is_running:
             try:
-                today_str = datetime.date.today().strftime("%Y-%m-%d")
-                
-                now = datetime.datetime.now()
-                
+                # 修正：Railway 容器通常是 UTC 时间，需转换为北京时间（UTC+8）
+                utc_now = datetime.datetime.utcnow()
+                beijing_now = utc_now + datetime.timedelta(hours=8)
+                today_str = beijing_now.strftime("%Y-%m-%d")
+                    
                 # 如果今天已经扫过了，且没有收到强制重扫信号，就进入长休眠
                 if self.last_scan_date == today_str:
                     print(f"[Scanner] Today's scan ({today_str}) already complete. Waiting for reset or next day...")
@@ -163,39 +187,37 @@ class BackgroundScanner:
                          print("[Scanner] Manual trigger detected. Restarting scan...")
                     self.reset_event.clear()
                     continue
-
+    
                 # 修正：跨天后必须等到收盘后 (15:00) 才能获取当日全量数据
-                # 否则获取的是昨日数据，且会导致今日后续真正收盘时不再运行
-                if now.hour < 15 and not self.reset_event.is_set():
-                    print(f"[Scanner] It's {now.strftime('%H:%M')}, market not closed yet. Waiting for 15:00 to start Daily Scan...")
-                    if self.reset_event.wait(1800): # 每 30 分钟检查一次，支持手动触发例外
+                if beijing_now.hour < 15 and not self.reset_event.is_set():
+                    print(f"[Scanner] It's {beijing_now.strftime('%H:%M')} (CN Time), market not closed yet. Waiting for 15:00...")
+                    if self.reset_event.wait(1800): # 每 30 分钟检查一次
                         print("[Scanner] Manual trigger detected. Force starting scan...")
                     else:
                         continue
-
+    
                 self.scan_count += 1
                 print(f"\n[Scanner] === Starting FULL-MARKET Scan #{self.scan_count} ({today_str}) ===")
-                
-                # 1. 获取全市场标的快照 (5000+)
+                    
+                # 1. 获取全市场标的快照
                 full_spot = self.fetcher.get_realtime_quotes([])
                 if full_spot.empty:
                     print("[Scanner] Warning: Could not fetch market spot. Retrying in 60s...")
                     time.sleep(60)
                     continue
-                
-                # 过滤垃圾股 (成交额太小的僵尸股不进 K 线程，节省流量)
+                    
+                # 过滤垃圾股
                 valid_spot = full_spot[full_spot['成交额'] > 5000000] # 500w 以上成交额
                 all_symbols = valid_spot['代码'].tolist()
-                print(f"[Scanner] Market snapshot loaded. Filtering to {len(all_symbols)} active candidates.")
-
+                print(f"[Scanner] Market snapshot loaded. Analyzing {len(all_symbols)} active candidates.")
+    
                 new_recommendations = []
                 weights = self.db.get_weights()
                 
                 # 从数据库获取最新新闻池用于辅助打分 (Read-Only)
-                # 只获取最近3天的新闻，并应用时间衰减
                 news_pool = []
                 try:
-                    db_news = self.db.get_latest_news(limit=100, max_age_days=3)  # 获取更多新闻，然后过滤
+                    db_news = self.db.get_latest_news(limit=100, max_age_days=3)
                     for dn in db_news:
                          news_pool.append({
                              "content": dn['content'],
@@ -204,94 +226,65 @@ class BackgroundScanner:
                              "sentiment": dn['sentiment'],
                              "created_at": dn.get('created_at', '')
                          })
-                    
-                    # 应用时间衰减过滤（过滤过期新闻并计算权重）
                     news_pool = time_decay.filter_news_by_age(news_pool)
-                    
-                    print(f"[Scanner] Loaded {len(news_pool)} valid news items (within 3 trading days) from DB for context awareness.")
+                    print(f"[Scanner] Loaded {len(news_pool)} valid news items for context awareness.")
                 except Exception as e:
                     print(f"[Scanner] Error loading news from DB: {e}")
                 
-                
-                # 定义单股处理函数供线程池调用
                 def process_stock(symbol):
                     try:
-                        # 0. 优先从数据库缓存中读取 K 线数据 (有效期 1 天)
                         kline = self.db.get_cached_kline(symbol)
                         if kline is None:
                             kline = self.fetcher.get_kline_data(symbol, days=150)
                             if not kline.empty:
                                 self.db.save_kline(symbol, kline)
-                        
                         if kline.empty: return None
-                        
-                        # 1. 优先从本地数据库读取个股画像 (避免重复请求 ak.stock_individual_info_em)
+                                        
                         stock_info = self.db.get_cached_stock_info(symbol)
                         if not stock_info:
                             stock_info = self.fetcher.get_stock_info(symbol)
                             if stock_info:
                                 self.db.save_stock_info(symbol, stock_info)
-                        
+                                        
                         stock_name = stock_info.get('股票简称', symbol)
                         stock_industry = stock_info.get('行业', '未知')
-                        
-                        # 2. 获取周线数据（用于多时间框架确认）
+                                        
+                        # 获取多维数据
                         weekly_kline = None
                         try:
                             weekly_kline = self.fetcher.get_kline_data(symbol, period="weekly", days=200)
-                            if weekly_kline.empty:
-                                weekly_kline = None
-                        except:
-                            weekly_kline = None
-                        
-                        # 3. 获取财务数据（用于基本面因子）
+                        except: pass
+                                        
                         finance_data = None
                         try:
                             finance_list = self.fetcher.get_company_finance(symbol)
-                            if finance_list and len(finance_list) > 0:
-                                finance_data = finance_list[0]
-                        except:
-                            finance_data = None
-                        
-                        # 4. 情感评估 - 使用行业匹配器进行智能匹配
-                        # 不仅检查股票名称是否在新闻中出现，还检查新闻分析的行业是否与股票行业匹配
+                            if finance_list: finance_data = finance_list[0]
+                        except: pass
+                                        
+                        # 情感匹配
                         dynamic_sent = 0.0
-                        
                         if news_pool:
-                            # 使用行业匹配器获取相关新闻
-                            # news_pool 结构: {content, title, sentiment}
                             matching_news = industry_matcher.get_matching_news(
-                                news_pool,
-                                stock_industry=stock_industry,
-                                stock_name=stock_name,
-                                symbol=symbol
+                                news_pool, stock_industry=stock_industry,
+                                stock_name=stock_name, symbol=symbol
                             )
-                            
                             if matching_news:
-                                # 使用行业匹配器计算情感得分（集成时间衰减）
-                                # 直接提及的新闻权重更高，行业匹配的新闻权重较低
-                                # 时间衰减会自动应用到每条新闻的得分上
                                 dynamic_sent = industry_matcher.calculate_sentiment_score(
-                                    matching_news,
-                                    direct_mention_weight=0.3,  # 直接提及每条0.3分
-                                    industry_match_weight=0.15,  # 行业匹配每条0.15分
-                                    time_decay_handler=time_decay  # 应用时间衰减
+                                    matching_news, time_decay_handler=time_decay
                                 )
-                                # 限制在合理范围内
                                 dynamic_sent = max(-1.0, min(1.0, dynamic_sent))
-
-                        # 5. 生成推荐（使用多因子模型）
+                
+                        # 生成推荐
                         rec = self.engine.generate_recommendation(
-                            kline, 
-                            dynamic_sent,
-                            tech_weight=weights.get('tech_weight', 0.6),  # 技术因子权重
-                            sentiment_weight=weights.get('sentiment_weight', 0.2),  # 消息面权重
-                            fundamental_weight=weights.get('fundamental_weight', 0.15),  # 基本面权重
-                            risk_weight=weights.get('risk_weight', 0.05),  # 风险因子权重
-                            finance_data=finance_data,  # 财务数据
-                            weekly_kline_df=weekly_kline  # 周线数据
+                            kline, dynamic_sent,
+                            tech_weight=weights.get('tech_weight', 0.6),
+                            sentiment_weight=weights.get('sentiment_weight', 0.2),
+                            fundamental_weight=weights.get('fundamental_weight', 0.15),
+                            risk_weight=weights.get('risk_weight', 0.05),
+                            finance_data=finance_data,
+                            weekly_kline_df=weekly_kline
                         )
-                        
+                                        
                         rec.update({
                             'symbol': symbol,
                             'name': stock_name,
@@ -300,42 +293,44 @@ class BackgroundScanner:
                             'change': float(stock_info.get('涨跌幅', 0)),
                             'turnover': float(stock_info.get('换手率', 0))
                         })
-                        
-                        # 只保存BUY和HOLD的推荐到数据库（用于回测）
+                                        
                         if rec['action'] in ["BUY", "HOLD"]:
-                            # 添加行业和因子得分信息
-                            rec_for_db = rec.copy()
-                            rec_for_db['industry'] = stock_industry
-                            rec_for_db['factor_scores'] = rec.get('factor_scores', {})
-                            self.db.save_recommendation(rec_for_db)
-                        
+                            self.db.save_recommendation(rec)
+                                        
                         return rec
                     except Exception as e:
-                        # print(f"[Scanner] Error processing {symbol}: {e}") # Too verbose
                         return None
-
-                # 2. 并发深度扫描 (限制 10 线程保护 API 负载)
-                print(f"[Scanner] Starting Concurrent Evaluation with 10 threads...")
-                with ThreadPoolExecutor(max_workers=10) as executor:
+                
+                # 2. 并发深度扫描
+                max_workers = 3
+                print(f"[Scanner] Starting Evaluation with {max_workers} concurrent workers...")
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
                     futures = {executor.submit(process_stock, sym): sym for sym in all_symbols}
                     done_count = 0
                     for future in concurrent.futures.as_completed(futures):
                         res = future.result()
                         if res:
                             new_recommendations.append(res)
-                            # 只保存BUY和HOLD的推荐到数据库（用于回测）
-                            if res['action'] in ["BUY", "HOLD"]:
-                                # 确保包含行业和因子得分信息
-                                rec_for_db = res.copy()
-                                if 'industry' not in rec_for_db:
-                                    rec_for_db['industry'] = '未知'
-                                if 'factor_scores' not in rec_for_db:
-                                    rec_for_db['factor_scores'] = {}
-                                self.db.save_recommendation(rec_for_db)
-                        
+                            
                         done_count += 1
-                        if done_count % 100 == 0:
-                            print(f"[Scanner] Progress: {done_count}/{len(all_symbols)} evaluated...")
+                        if done_count % 50 == 0 or done_count == len(all_symbols):
+                            print(f"[Scanner] Progress: {done_count}/{len(all_symbols)} evaluated ({(done_count/len(all_symbols)*100):.1f}%)...")
+    
+                # 3. 更新内存缓存 (按评分排序，取前 12 个)
+                if not new_recommendations:
+                    print("[Scanner] Warning: All evaluations failed. Results empty.")
+                    self.latest_results = []
+                else:
+                    full_ranks = sorted(new_recommendations, key=lambda x: x['score'], reverse=True)
+                    self.latest_results = full_ranks[:12]
+                    self.last_scan_date = today_str 
+                    self.db.save_daily_scan(today_str, full_ranks)
+                    print(f"[Scanner] Full Scan Complete. Saved {len(full_ranks)} stocks to Database.")
+                    
+                self.reset_event.clear()
+            except Exception as e:
+                print(f"[Scanner] Critical Error in Loop: {e}")
+                time.sleep(60)
 
                 # 3. 更新内存缓存 (按评分排序，取前 12 个)
                 if not new_recommendations:
