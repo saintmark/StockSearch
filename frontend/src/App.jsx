@@ -884,12 +884,47 @@ const NewsDetailedCard = ({ item, onShowDetail }) => {
           <span className="text-sm font-black text-gray-400 font-mono italic">
             {(() => {
               const timeStr = item.时间 || item.time || '';
+              const created_at = item.created_at || '';
+              
+              // 如果时间只有时间没有日期，尝试使用 created_at 补充日期
+              let fullTimeStr = timeStr;
+              if (timeStr && !timeStr.includes('-') && timeStr.includes(':')) {
+                // 只有时间，没有日期（格式如 "19:34:12"）
+                if (created_at) {
+                  try {
+                    const createdDate = new Date(created_at);
+                    if (!isNaN(createdDate.getTime())) {
+                      fullTimeStr = `${createdDate.getFullYear()}-${String(createdDate.getMonth() + 1).padStart(2, '0')}-${String(createdDate.getDate()).padStart(2, '0')} ${timeStr}`;
+                    } else {
+                      // created_at 解析失败，使用当前日期
+                      const now = new Date();
+                      fullTimeStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')} ${timeStr}`;
+                    }
+                  } catch (e) {
+                    // 如果 created_at 解析失败，使用当前日期
+                    const now = new Date();
+                    fullTimeStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')} ${timeStr}`;
+                  }
+                } else {
+                  // 没有 created_at，使用当前日期
+                  const now = new Date();
+                  fullTimeStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')} ${timeStr}`;
+                }
+              }
+              
               // 如果是完整日期时间格式（包含日期），格式化显示
-              if (timeStr.includes('-') && timeStr.includes(':')) {
+              if (fullTimeStr.includes('-') && fullTimeStr.includes(':')) {
                 try {
-                  const date = new Date(timeStr);
+                  const date = new Date(fullTimeStr);
+                  if (isNaN(date.getTime())) {
+                    return timeStr; // 解析失败，返回原始值
+                  }
                   const today = new Date();
-                  const isToday = date.toDateString() === today.toDateString();
+                  today.setHours(0, 0, 0, 0);
+                  const newsDate = new Date(date);
+                  newsDate.setHours(0, 0, 0, 0);
+                  const isToday = newsDate.getTime() === today.getTime();
+                  
                   if (isToday) {
                     // 今天的新闻只显示时间
                     return date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
@@ -897,7 +932,7 @@ const NewsDetailedCard = ({ item, onShowDetail }) => {
                     // 非今天的新闻显示日期和时间
                     return date.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false });
                   }
-                } catch {
+                } catch (e) {
                   return timeStr;
                 }
               }

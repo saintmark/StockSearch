@@ -462,19 +462,33 @@ class DatabaseManager:
                 created_at = row[4]
                 
                 # 如果 publish_time 只有时间没有日期，使用 created_at 的日期
-                if publish_time and ':' in publish_time and len(publish_time.split(':')) >= 2:
-                    if len(publish_time) <= 8 and '-' not in publish_time:
-                        # 只有时间，使用 created_at 的日期
-                        if created_at:
-                            try:
-                                if isinstance(created_at, str):
-                                    created_dt = datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S")
-                                else:
-                                    created_dt = created_at
-                                publish_time = f"{created_dt.strftime('%Y-%m-%d')} {publish_time}"
-                            except:
-                                # 如果解析失败，使用当前日期
-                                publish_time = f"{datetime.now().strftime('%Y-%m-%d')} {publish_time}"
+                if publish_time:
+                    publish_time_str = str(publish_time).strip()
+                    # 检查是否只有时间（格式如 "19:34:12" 或 "19:34"）
+                    if ':' in publish_time_str and len(publish_time_str.split(':')) >= 2:
+                        # 检查是否包含日期（包含 '-' 且长度 > 10）
+                        if len(publish_time_str) <= 8 or '-' not in publish_time_str:
+                            # 只有时间，使用 created_at 的日期
+                            if created_at:
+                                try:
+                                    if isinstance(created_at, str):
+                                        # 尝试多种日期格式
+                                        try:
+                                            created_dt = datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S")
+                                        except:
+                                            try:
+                                                created_dt = datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S.%f")
+                                            except:
+                                                created_dt = datetime.now()
+                                    else:
+                                        created_dt = created_at
+                                    publish_time = f"{created_dt.strftime('%Y-%m-%d')} {publish_time_str}"
+                                except Exception as e:
+                                    # 如果解析失败，使用当前日期
+                                    publish_time = f"{datetime.now().strftime('%Y-%m-%d')} {publish_time_str}"
+                            else:
+                                # 没有 created_at，使用当前日期
+                                publish_time = f"{datetime.now().strftime('%Y-%m-%d')} {publish_time_str}"
                 
                 result.append({
                     "title": row[0],
