@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+*.db
+*.db-journal
+*.pkl
+
+# Node
+node_modules/
+dist/
+build/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+
+# Railway
+.railway/
+
+# Database
+server/stock_logic.db
+server/stock_logic.db-journal
+server/*.pkl
+
+# Project directories
+test/
+readme/
+
