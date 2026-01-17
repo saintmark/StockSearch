@@ -396,6 +396,45 @@ def get_stock_finance(symbol: str):
     """获取公司核心财务指标"""
     return fetcher.get_company_finance(symbol)
 
+@app.get("/api/industry/sentiment")
+def get_industry_sentiment():
+    """获取行业情绪值（当前周和上周）"""
+    try:
+        # 如果当前周没有数据，尝试从历史新闻初始化
+        week_start = db.get_week_start_date()
+        conn = db.get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT COUNT(*) FROM industry_sentiment_weekly 
+                WHERE week_start_date = ?
+            ''', (week_start,))
+            count = cursor.fetchone()[0]
+            if count == 0:
+                # 当前周没有数据，从历史新闻初始化
+                print(f"[API] No sentiment data for current week ({week_start}). Initializing from history...")
+                init_count = db.initialize_industry_sentiment_from_history()
+                print(f"[API] Initialized {init_count} industry sentiment records.")
+        finally:
+            conn.close()
+        
+        result = db.get_current_and_last_week_sentiment()
+        print(f"[API] Returning sentiment data: current_week={len(result.get('current_week', []))}, last_week={len(result.get('last_week', []))}")
+        return result
+    except Exception as e:
+        print(f"[API] Error getting industry sentiment: {e}")
+        import traceback
+        traceback.print_exc()
+        # 即使出错也返回一个空结构，让前端能正常显示
+        return {
+            "current_week": [],
+            "last_week": [],
+            "current_week_start": "",
+            "last_week_start": "",
+            "market_sentiment": 1.0,
+            "error": str(e)
+        }
+
 @app.get("/api/news/flash")
 def get_news_flash():
     """获取最新财经快讯 (优先读库，实现毫秒级响应)"""

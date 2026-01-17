@@ -153,6 +153,27 @@ class DatabaseManager:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
+            
+            # 7. 行业情绪值周累积表
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS industry_sentiment_weekly (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    industry TEXT NOT NULL,
+                    week_start_date TEXT NOT NULL,  -- 周开始日期 (YYYY-MM-DD)
+                    sentiment_score REAL DEFAULT 1.0,  -- 情绪值，默认1.0
+                    news_count INTEGER DEFAULT 0,  -- 该周该行业的新闻数量
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(industry, week_start_date)
+                )
+            ''')
+            
+            # 创建索引提高查询效率
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_industry_week 
+                ON industry_sentiment_weekly(industry, week_start_date)
+            ''')
+            
             conn.commit()
         finally:
             conn.close()
@@ -377,39 +398,50 @@ class DatabaseManager:
             conn.close()
 
     def save_news_batch(self, news_list: list):
-        """批量保存已分析的新闻"""
+        """批量保存已分析的新闻，并更新行业情绪值"""
         if not news_list:
             return
-        
+            
         conn = self.get_connection()
         try:
             cursor = conn.cursor()
             current_date = datetime.now().date()
+            week_start = self.get_week_start_date()
+                
+            # 用于累积本批次的情绪值，最后统一更新数据库，减少 IO
+            sentiment_updates = {} # {industry: {'score_sum': float, 'count': int}}
+    
+            import hashlib
             for item in news_list:
                 # 生成唯一主键：标题 + 发布时间
                 raw_time = item.get('time', '')
                 if raw_time is None: raw_time = ""
                 # 强转为字符串，防止 datetime.time 类型导致 sqlite 报错
                 publish_time_str = str(raw_time)
-                
+                            
                 # 如果时间只有时间没有日期（格式如 "14:30:00"），添加当前日期
                 if ':' in publish_time_str and len(publish_time_str.split(':')) >= 2:
                     # 检查是否只有时间（长度 <= 8，如 "14:30:00"）
                     if len(publish_time_str) <= 8 and '-' not in publish_time_str:
                         # 只有时间，添加当前日期
                         publish_time_str = f"{current_date.strftime('%Y-%m-%d')} {publish_time_str}"
-                    # 如果已经是完整日期时间格式，保持不变
-                
+                            
                 unique_str = f"{item.get('title', '')}_{publish_time_str}"
-                title_hash = str(hash(unique_str)) 
-                
+                # 使用 md5 生成稳定的哈希值，避免 Python hash() 随进程重启而变化
+                title_hash = hashlib.md5(unique_str.encode('utf-8')).hexdigest() 
+                            
                 # 检查 sentiment 是否为字典，需序列化
                 sentiment_data = item.get('sentiment', {})
                 if isinstance(sentiment_data, dict):
                     sentiment_json = json.dumps(sentiment_data)
+                    sector = sentiment_data.get('sector')
+                    score = sentiment_data.get('score', 0.0)
                 else:
                     sentiment_json = str(sentiment_data)
-
+                    sector = None
+                    score = 0.0
+    
+                # 尝试插入新闻
                 cursor.execute('''
                     INSERT OR IGNORE INTO news_analysis (title_hash, title, content, publish_time, sentiment_json)
                     VALUES (?, ?, ?, ?, ?)
@@ -420,9 +452,52 @@ class DatabaseManager:
                     publish_time_str, 
                     sentiment_json
                 ))
+                    
+                # 如果插入成功（rowcount > 0），则说明是新新闻，需要累积情绪值
+                if cursor.rowcount > 0 and sector:
+                    # 记录行业情绪
+                    if sector not in sentiment_updates:
+                        sentiment_updates[sector] = {'score_sum': 0.0, 'count': 0}
+                    sentiment_updates[sector]['score_sum'] += float(score)
+                    sentiment_updates[sector]['count'] += 1
+                        
+                    # 记录全市场情绪
+                    if "全市场" not in sentiment_updates:
+                        sentiment_updates["全市场"] = {'score_sum': 0.0, 'count': 0}
+                    sentiment_updates["全市场"]["score_sum"] += float(score)
+                    sentiment_updates["全市场"]["count"] += 1
+                
+            # 批量更新行业情绪值表
+            for industry, data in sentiment_updates.items():
+                # 检查是否存在记录
+                cursor.execute('''
+                    SELECT sentiment_score, news_count 
+                    FROM industry_sentiment_weekly 
+                    WHERE industry = ? AND week_start_date = ?
+                ''', (industry, week_start))
+                    
+                row = cursor.fetchone()
+                if row:
+                    # 累积更新：基础分 + (总分 * 0.1)
+                    # 注意：sentiment_score 存储的是 1.0 + sum(individual_score * 0.1)
+                    new_score = row[0] + (data['score_sum'] * 0.1)
+                    new_count = row[1] + data['count']
+                    cursor.execute('''
+                        UPDATE industry_sentiment_weekly 
+                        SET sentiment_score = ?, news_count = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE industry = ? AND week_start_date = ?
+                    ''', (new_score, new_count, industry, week_start))
+                else:
+                    # 新建记录：初始分 1.0 + (总分 * 0.1)
+                    cursor.execute('''
+                        INSERT INTO industry_sentiment_weekly (industry, week_start_date, sentiment_score, news_count)
+                        VALUES (?, ?, ?, ?)
+                    ''', (industry, week_start, 1.0 + (data['score_sum'] * 0.1), data['count']))
+                
             conn.commit()
         except Exception as e:
             print(f"[Database] Error saving news batch: {e}")
+            conn.rollback()
         finally:
             conn.close()
 
@@ -498,6 +573,246 @@ class DatabaseManager:
                     "created_at": row[4]  # 添加创建时间，用于进一步的时间衰减计算
                 })
             return result
+        finally:
+            conn.close()
+    
+    def get_week_start_date(self, date_obj=None):
+        """获取指定日期所在周的开始日期（周一）"""
+        if date_obj is None:
+            date_obj = datetime.now().date()
+        if isinstance(date_obj, str):
+            date_obj = datetime.strptime(date_obj, "%Y-%m-%d").date()
+        
+        # 获取周一（weekday() 返回 0-6，0是周一）
+        days_since_monday = date_obj.weekday()
+        week_start = date_obj - timedelta(days=days_since_monday)
+        return week_start.strftime("%Y-%m-%d")
+    
+    def update_industry_sentiment(self, industry: str, sentiment_score: float):
+        """
+        更新行业情绪值（累积模式）
+        
+        Args:
+            industry: 行业名称（如 "半导体"、"全市场"）
+            sentiment_score: 新闻的情感得分（-1.0 到 1.0）
+        """
+        if not industry:
+            return
+        
+        conn = self.get_connection()
+        try:
+            cursor = conn.cursor()
+            week_start = self.get_week_start_date()
+            
+            # 获取当前周的情绪值，如果不存在则创建（默认1.0）
+            cursor.execute('''
+                SELECT sentiment_score, news_count 
+                FROM industry_sentiment_weekly 
+                WHERE industry = ? AND week_start_date = ?
+            ''', (industry, week_start))
+            
+            row = cursor.fetchone()
+            if row:
+                current_score = row[0]
+                news_count = row[1]
+            else:
+                # 新周开始，初始化为1.0
+                current_score = 1.0
+                news_count = 0
+                cursor.execute('''
+                    INSERT INTO industry_sentiment_weekly (industry, week_start_date, sentiment_score, news_count)
+                    VALUES (?, ?, ?, ?)
+                ''', (industry, week_start, current_score, news_count))
+            
+            # 累积情绪值：基础分1.0 + 新闻得分
+            # 使用加权平均，避免单条新闻影响过大
+            new_score = current_score + (sentiment_score * 0.1)  # 每条新闻影响0.1分
+            new_news_count = news_count + 1
+            
+            # 更新情绪值和新闻数量
+            cursor.execute('''
+                UPDATE industry_sentiment_weekly 
+                SET sentiment_score = ?, news_count = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE industry = ? AND week_start_date = ?
+            ''', (new_score, new_news_count, industry, week_start))
+            
+            conn.commit()
+        except Exception as e:
+            print(f"[Database] Error updating industry sentiment: {e}")
+            conn.rollback()
+        finally:
+            conn.close()
+    
+    def get_industry_sentiment_weekly(self, week_start_date: str = None):
+        """
+        获取指定周的各行业情绪值
+        
+        Args:
+            week_start_date: 周开始日期（YYYY-MM-DD），如果为None则返回当前周
+        
+        Returns:
+            List[Dict]: 行业情绪值列表，每个元素包含 industry, sentiment_score, news_count
+        """
+        if week_start_date is None:
+            week_start_date = self.get_week_start_date()
+        
+        conn = self.get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT industry, sentiment_score, news_count
+                FROM industry_sentiment_weekly
+                WHERE week_start_date = ?
+                ORDER BY sentiment_score DESC
+            ''', (week_start_date,))
+            
+            rows = cursor.fetchall()
+            result = []
+            for row in rows:
+                result.append({
+                    "industry": row[0],
+                    "sentiment_score": row[1],
+                    "news_count": row[2]
+                })
+            return result
+        finally:
+            conn.close()
+    
+    def get_current_and_last_week_sentiment(self):
+        """
+        获取当前周和上周的行业情绪值
+        
+        Returns:
+            Dict: {
+                "current_week": List[Dict],
+                "last_week": List[Dict],
+                "current_week_start": str,
+                "last_week_start": str,
+                "market_sentiment": float  # 全市场情绪值
+            }
+        """
+        current_week_start = self.get_week_start_date()
+        current_date = datetime.now().date()
+        # 计算上周开始日期
+        days_since_monday = current_date.weekday()
+        last_week_start = (current_date - timedelta(days=days_since_monday + 7)).strftime("%Y-%m-%d")
+        
+        current_week_data = self.get_industry_sentiment_weekly(current_week_start)
+        last_week_data = self.get_industry_sentiment_weekly(last_week_start)
+        
+        # 提取全市场情绪值
+        market_sentiment = 1.0
+        for item in current_week_data:
+            if item["industry"] == "全市场":
+                market_sentiment = item["sentiment_score"]
+                break
+        
+        return {
+            "current_week": current_week_data,
+            "last_week": last_week_data,
+            "current_week_start": current_week_start,
+            "last_week_start": last_week_start,
+            "market_sentiment": market_sentiment
+        }
+    
+    def initialize_industry_sentiment_from_history(self):
+        """
+        从历史新闻数据初始化行业情绪值（用于首次使用或数据迁移）
+        查询一周内的所有新闻，根据行业和情感得分累积计算各行业的情绪值
+        """
+        conn = self.get_connection()
+        try:
+            cursor = conn.cursor()
+            
+            # 获取当前周的开始日期
+            week_start = self.get_week_start_date()
+            
+            # 检查当前周是否已有数据
+            cursor.execute('''
+                SELECT COUNT(*) FROM industry_sentiment_weekly 
+                WHERE week_start_date = ?
+            ''', (week_start,))
+            existing_count = cursor.fetchone()[0]
+            
+            if existing_count > 0:
+                print(f"[Database] Industry sentiment for week {week_start} already exists. Skipping initialization.")
+                return existing_count
+            
+            # 查询一周内的所有新闻（从本周一开始到今天）
+            current_date = datetime.now().date()
+            days_since_monday = current_date.weekday()
+            week_start_date_obj = current_date - timedelta(days=days_since_monday)
+            
+            # 查询本周内的所有新闻（使用日期字符串格式匹配）
+            week_start_str = week_start_date_obj.strftime("%Y-%m-%d")
+            print(f"[Database] Querying news from {week_start_str} (week start: {week_start})")
+            # SQLite 的日期比较：created_at 是 TIMESTAMP，需要转换为日期字符串比较
+            cursor.execute('''
+                SELECT sentiment_json, created_at
+                FROM news_analysis
+                WHERE DATE(created_at) >= ?
+                ORDER BY created_at ASC
+            ''', (week_start_str,))
+            
+            rows = cursor.fetchall()
+            print(f"[Database] Found {len(rows)} news items for week {week_start}")
+            
+            if not rows:
+                print(f"[Database] No news found for week {week_start}. Cannot initialize sentiment.")
+                return 0
+            
+            # 统计各行业的情绪值
+            industry_scores = {}  # {industry: {'score': float, 'count': int}}
+            
+            for row in rows:
+                try:
+                    sentiment_json = row[0]
+                    if not sentiment_json:
+                        continue
+                    
+                    sentiment = json.loads(sentiment_json)
+                    if not isinstance(sentiment, dict):
+                        continue
+                    
+                    sector = sentiment.get('sector', '')
+                    score = sentiment.get('score', 0.0)
+                    
+                    if not sector or not isinstance(score, (int, float)):
+                        continue
+                    
+                    # 累积各行业的情绪值
+                    if sector not in industry_scores:
+                        industry_scores[sector] = {'score': 1.0, 'count': 0}  # 基础分1.0
+                    
+                    # 每条新闻影响0.1分
+                    industry_scores[sector]['score'] += float(score) * 0.1
+                    industry_scores[sector]['count'] += 1
+                    
+                except Exception as e:
+                    print(f"[Database] Error processing news sentiment: {e}")
+                    continue
+            
+            # 将统计结果写入数据库
+            inserted_count = 0
+            for industry, data in industry_scores.items():
+                try:
+                    cursor.execute('''
+                        INSERT OR REPLACE INTO industry_sentiment_weekly 
+                        (industry, week_start_date, sentiment_score, news_count, updated_at)
+                        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ''', (industry, week_start, data['score'], data['count']))
+                    inserted_count += 1
+                except Exception as e:
+                    print(f"[Database] Error inserting industry sentiment for {industry}: {e}")
+            
+            conn.commit()
+            print(f"[Database] Initialized {inserted_count} industry sentiment records from {len(rows)} historical news items.")
+            return inserted_count
+            
+        except Exception as e:
+            print(f"[Database] Error initializing industry sentiment from history: {e}")
+            conn.rollback()
+            return 0
         finally:
             conn.close()
     

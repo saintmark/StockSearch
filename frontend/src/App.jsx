@@ -4,6 +4,7 @@ import { LayoutDashboard, Newspaper, TrendingUp, History, Settings, Search, Bell
 import { initStockChart } from './utils/chartUtils';
 import IndustryPieChart from './components/IndustryPieChart';
 import BacktestPerformance from './components/BacktestPerformance';
+import IndustrySentimentChart from './components/IndustrySentimentChart';
 
 const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:8000/api";
 
@@ -29,6 +30,7 @@ const App = () => {
   const [rankPagination, setRankPagination] = useState({ total: 0, page: 1, page_size: 500, total_pages: 0 });
   const [industryStats, setIndustryStats] = useState([]); // 新增：行业统计数据
   const [sectors, setSectors] = useState([]); // 新增：全行业列表
+  const [industrySentiment, setIndustrySentiment] = useState(null); // 新增：行业情绪值数据
 
   // 新增：排行榜筛选与排序状态（服务端分页需要状态提升）
   const [rankFilter, setRankFilter] = useState({ sector: '', minPrice: '', maxPrice: '', search: '' });
@@ -41,29 +43,68 @@ const App = () => {
   const fetchData = async () => {
     setLoadingNews(true);
     setLoadingRecs(true);
-    try {
-      const newsRes = await axios.get(`${API_BASE}/news/flash`);
-      const sortedNews = Array.isArray(newsRes.data) ? [...newsRes.data].reverse() : [];
-      setNews(sortedNews);
-
-      const recRes = await axios.get(`${API_BASE}/stocks/market_recommendations`);
-      setRecommendations(Array.isArray(recRes.data) ? recRes.data : []);
-
-      const perfRes = await axios.get(`${API_BASE}/review/performance`);
-      // 新API返回格式：{ performance_data, overall_metrics, grouped_metrics }
-      if (perfRes.data && typeof perfRes.data === 'object' && !Array.isArray(perfRes.data)) {
-        setPerformance(perfRes.data);
-      } else {
-        // 兼容旧格式
-        setPerformance({
-          performance_data: Array.isArray(perfRes.data) ? perfRes.data : [],
-          overall_metrics: {},
-          grouped_metrics: {}
+    
+    // 1. 获取行业情绪值 (独立获取，不影响其他数据)
+    const fetchSentiment = async () => {
+      try {
+        const sentimentRes = await axios.get(`${API_BASE}/industry/sentiment`);
+        if (sentimentRes.data) {
+          setIndustrySentiment(sentimentRes.data);
+        }
+      } catch (err) {
+        console.error("[Industry Sentiment] Fetch error:", err);
+        setIndustrySentiment({
+          current_week: [],
+          last_week: [],
+          current_week_start: "",
+          last_week_start: "",
+          market_sentiment: 1.0
         });
       }
+    };
+    fetchSentiment();
 
-      const weightRes = await axios.get(`${API_BASE}/review/weights`);
-      if (weightRes.data) setWeights(weightRes.data);
+    try {
+      // 2. 获取新闻数据
+      try {
+        const newsRes = await axios.get(`${API_BASE}/news/flash`);
+        const sortedNews = Array.isArray(newsRes.data) ? [...newsRes.data].reverse() : [];
+        setNews(sortedNews);
+      } catch (err) {
+        console.error("News fetch error", err);
+      }
+
+      // 3. 获取推荐数据
+      try {
+        const recRes = await axios.get(`${API_BASE}/stocks/market_recommendations`);
+        setRecommendations(Array.isArray(recRes.data) ? recRes.data : []);
+      } catch (err) {
+        console.error("Recommendations fetch error", err);
+      }
+
+      // 4. 获取绩效数据
+      try {
+        const perfRes = await axios.get(`${API_BASE}/review/performance`);
+        if (perfRes.data && typeof perfRes.data === 'object' && !Array.isArray(perfRes.data)) {
+          setPerformance(perfRes.data);
+        } else {
+          setPerformance({
+            performance_data: Array.isArray(perfRes.data) ? perfRes.data : [],
+            overall_metrics: {},
+            grouped_metrics: {}
+          });
+        }
+      } catch (err) {
+        console.error("Performance fetch error", err);
+      }
+
+      // 5. 获取权重数据
+      try {
+        const weightRes = await axios.get(`${API_BASE}/review/weights`);
+        if (weightRes.data) setWeights(weightRes.data);
+      } catch (err) {
+        console.error("Weights fetch error", err);
+      }
 
       // 获取排行榜数据（第1页）
       fetchRankData(1);
@@ -374,13 +415,64 @@ PE: ${financeData?.['市盈率'] || '--'}
         {/* Content Tabs */}
         <div className="flex-1 overflow-y-auto custom-scrollbar p-8">
           {activeTab === 'news' ? (
-            <div className="max-w-4xl mx-auto space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
+            <div className="max-w-7xl mx-auto space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
               <div className="flex items-center justify-between">
                 <h2 className="text-3xl font-black text-white flex items-center gap-3">
                   <div className="p-2 bg-primary/10 rounded-lg"><Newspaper className="text-primary" size={28} /></div>
                   全市场实时快讯
                 </h2>
               </div>
+              
+              {/* 行业情绪值图表 */}
+              <div className="bg-card border border-gray-800 rounded-[32px] p-8 shadow-2xl">
+                <h3 className="text-xl font-black text-white mb-6 flex items-center gap-2">
+                  <BarChart3 className="text-primary" size={24} />
+                  行业情绪值周度分析
+                </h3>
+                {industrySentiment ? (
+                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                    {/* 当前周 */}
+                    <div className="bg-gray-900/50 rounded-2xl p-6 border border-gray-800">
+                      {industrySentiment.current_week && industrySentiment.current_week.length > 0 ? (
+                        <IndustrySentimentChart
+                          data={industrySentiment.current_week}
+                          weekLabel={`当前周 (${industrySentiment.current_week_start || ''})`}
+                          marketSentiment={industrySentiment.market_sentiment}
+                        />
+                      ) : (
+                        <div className="h-[500px] flex flex-col items-center justify-center text-gray-600">
+                          <BarChart3 size={48} className="mb-4 opacity-20" />
+                          <p>本周暂无情绪数据</p>
+                          <p className="text-xs mt-1">等待更多新闻采集分析中...</p>
+                        </div>
+                      )}
+                    </div>
+                    
+                    {/* 上周 */}
+                    <div className="bg-gray-900/50 rounded-2xl p-6 border border-gray-800">
+                      {industrySentiment.last_week && industrySentiment.last_week.length > 0 ? (
+                        <IndustrySentimentChart
+                          data={industrySentiment.last_week}
+                          weekLabel={`上周 (${industrySentiment.last_week_start || ''})`}
+                          marketSentiment={undefined}
+                        />
+                      ) : (
+                        <div className="h-[500px] flex flex-col items-center justify-center text-gray-600">
+                          <History size={48} className="mb-4 opacity-20" />
+                          <p>上周无历史数据</p>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="text-center py-12 text-gray-500">
+                    <p className="mb-2">正在加载行业情绪值数据...</p>
+                    <p className="text-sm">等待新闻扫描完成后将显示数据</p>
+                  </div>
+                )}
+              </div>
+              
+              {/* 新闻列表 */}
               <div className="grid grid-cols-1 gap-4">
                 {news.map((item, idx) => <NewsDetailedCard key={idx} item={item} onShowDetail={setScoreDetail} />)}
               </div>
@@ -622,7 +714,7 @@ PE: ${financeData?.['市盈率'] || '--'}
                         </p>
                         <p className="text-gray-500 font-bold flex items-center gap-2 text-sm">
                           <Info size={14} className="text-primary" />
-                          置信度评分 <span className="text-primary">{selectedRec.score}</span>
+                          置信度评分 <span className="text-primary">{typeof selectedRec.score === 'number' ? selectedRec.score.toFixed(2) : selectedRec.score}</span>
                         </p>
                       </div>
                     </div>
@@ -725,7 +817,7 @@ PE: ${financeData?.['市盈率'] || '--'}
                   <div className="flex items-center justify-between">
                     <span className="text-sm text-gray-400 font-bold uppercase tracking-widest">综合影响得分</span>
                     <span className={`text-4xl font-black ${scoreDetail.score > 0 ? 'text-success' : scoreDetail.score < 0 ? 'text-danger' : 'text-primary'}`}>
-                      {scoreDetail.score}
+                      {typeof scoreDetail.score === 'number' ? scoreDetail.score.toFixed(2) : scoreDetail.score}
                     </span>
                   </div>
                   <div className="w-full bg-gray-800 h-2 rounded-full overflow-hidden">
@@ -826,6 +918,45 @@ const StatCard = ({ label, value, trend, isDown, color }) => (
 const NewsItem = ({ time, content, sentiment, onShowDetail }) => {
   const isPos = sentiment?.sentiment === 'positive';
   const isNeg = sentiment?.sentiment === 'negative';
+  
+  // 格式化时间显示
+  const formatTime = (timeStr) => {
+    if (!timeStr) return '';
+    
+    // 如果只有时间（格式如 "19:34:12"），添加当前日期
+    let fullTimeStr = timeStr;
+    if (timeStr.includes(':') && !timeStr.includes('-')) {
+      const now = new Date();
+      fullTimeStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')} ${timeStr}`;
+    }
+    
+    // 如果是完整日期时间格式（包含日期），格式化显示
+    if (fullTimeStr.includes('-') && fullTimeStr.includes(':')) {
+      try {
+        const date = new Date(fullTimeStr);
+        if (isNaN(date.getTime())) {
+          return timeStr; // 解析失败，返回原始值
+        }
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        const newsDate = new Date(date);
+        newsDate.setHours(0, 0, 0, 0);
+        const isToday = newsDate.getTime() === today.getTime();
+        
+        if (isToday) {
+          // 始终显示日期和时间
+          return date.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+        } else {
+          // 非今天的新闻显示日期和时间
+          return date.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false });
+        }
+      } catch {
+        return timeStr;
+      }
+    }
+    return timeStr;
+  };
+  
   return (
     <div className={`p-4 rounded-2xl border border-gray-800/50 bg-gray-900/20 hover:bg-gray-800/40 transition-all group cursor-default relative overflow-hidden`}>
       {isPos && <div className="absolute left-0 top-0 bottom-0 w-1 bg-success/40" />}
@@ -833,27 +964,7 @@ const NewsItem = ({ time, content, sentiment, onShowDetail }) => {
       <div className="flex justify-between items-start mb-2">
         <div className="flex items-center gap-2">
           <span className="text-[10px] font-mono text-gray-500">
-            {(() => {
-              const timeStr = time || '';
-              // 如果是完整日期时间格式（包含日期），格式化显示
-              if (timeStr.includes('-') && timeStr.includes(':')) {
-                try {
-                  const date = new Date(timeStr);
-                  const today = new Date();
-                  const isToday = date.toDateString() === today.toDateString();
-                  if (isToday) {
-                    // 今天的新闻只显示时间
-                    return date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
-                  } else {
-                    // 非今天的新闻显示日期和时间
-                    return date.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false });
-                  }
-                } catch {
-                  return timeStr;
-                }
-              }
-              return timeStr;
-            })()}
+            {formatTime(time)}
           </span>
           {sentiment?.sector && <span className="text-[9px] font-black text-primary/60 uppercase">{sentiment.sector}</span>}
         </div>
@@ -862,7 +973,7 @@ const NewsItem = ({ time, content, sentiment, onShowDetail }) => {
             onClick={(e) => { e.stopPropagation(); onShowDetail(sentiment); }}
             className={`text-[8px] font-black px-1.5 py-0.5 rounded uppercase border cursor-help hover:scale-105 transition-transform ${isPos ? 'text-success border-success/30 bg-success/5' : isNeg ? 'text-danger border-danger/30 bg-danger/5' : 'text-gray-500 border-gray-700'}`}
           >
-            Score: {sentiment.score}
+            Score: {typeof sentiment.score === 'number' ? sentiment.score.toFixed(2) : sentiment.score}
           </span>
         )}
       </div>
@@ -926,8 +1037,8 @@ const NewsDetailedCard = ({ item, onShowDetail }) => {
                   const isToday = newsDate.getTime() === today.getTime();
                   
                   if (isToday) {
-                    // 今天的新闻只显示时间
-                    return date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+                    // 始终显示日期和时间
+                    return date.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
                   } else {
                     // 非今天的新闻显示日期和时间
                     return date.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false });
@@ -949,7 +1060,7 @@ const NewsDetailedCard = ({ item, onShowDetail }) => {
           <div
             onClick={(e) => { e.stopPropagation(); onShowDetail(item.sentiment); }}
             className={`px-4 py-1.5 rounded-full text-xs font-black uppercase tracking-widest cursor-help hover:brightness-125 transition-all ${isPos ? 'bg-success text-white shadow-lg shadow-success/20' : isNeg ? 'bg-danger text-white shadow-lg shadow-danger/20' : 'bg-gray-800 text-gray-400'
-              }`}>IMPACT SCORE: {item.sentiment.score}</div>
+              }`}>IMPACT SCORE: {typeof item.sentiment.score === 'number' ? item.sentiment.score.toFixed(2) : item.sentiment.score}</div>
         )}
       </div>
       <p className="text-lg text-white font-medium leading-[1.6] leading-relaxed">{item.内容 || item.content}</p>
@@ -982,7 +1093,7 @@ const RecCard = ({ rec, onSelect }) => {
           <h4 className="font-black text-xl text-white tracking-tight line-clamp-1">{rec.name || rec.symbol}</h4>
           <div className="flex items-center gap-2 mt-1">
             <span className="text-[10px] text-gray-500 font-bold uppercase tracking-widest">{rec.symbol}:</span>
-            <span className="text-sm font-black text-primary">{rec.score}</span>
+            <span className="text-sm font-black text-primary">{typeof rec.score === 'number' ? rec.score.toFixed(2) : rec.score}</span>
           </div>
         </div>
       </div>
@@ -1111,7 +1222,7 @@ const MarketRankTable = ({ data, onSelectRec, loading, pagination, onPageChange,
                 </td>
                 <td className="px-8 py-6 text-center">
                   <div className="inline-flex items-center justify-center w-12 h-12 bg-primary/10 rounded-2xl border border-primary/20 text-primary font-black text-lg">
-                    {item.score}
+                    {typeof item.score === 'number' ? item.score.toFixed(2) : item.score}
                   </div>
                 </td>
                 <td className="px-8 py-6 text-right">
