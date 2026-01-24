@@ -174,6 +174,33 @@ class DatabaseManager:
                 )
             ''')
             
+            # 8. 一夜持股策略交易记录表
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS one_night_trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT,
+                    name TEXT,
+                    buy_date TEXT,      -- 买入日期 YYYY-MM-DD
+                    buy_price REAL,     -- 买入价格
+                    quantity INTEGER,   -- 买入数量
+                    amount REAL,        -- 买入金额 (quantity * buy_price)
+                    sell_date TEXT,     -- 卖出日期
+                    sell_price REAL,    -- 卖出价格
+                    sell_amount REAL,   -- 卖出金额
+                    pnl REAL,           -- 盈亏额 (sell_amount - amount - fees)
+                    pnl_pct REAL,       -- 盈亏率
+                    fees REAL,          -- 手续费总额
+                    status TEXT DEFAULT 'HOLD', -- HOLD / SOLD
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
+            # 创建索引
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_trades_status 
+                ON one_night_trades(status)
+            ''')
+            
             # 创建索引提高查询效率
             cursor.execute('''
                 CREATE INDEX IF NOT EXISTS idx_industry_week 
@@ -580,6 +607,59 @@ class DatabaseManager:
 
             result.sort(key=parse_to_ts, reverse=True)
             return result
+        finally:
+            conn.close()
+
+    def log_trade(self, trade_data: dict):
+        """记录一笔新的模拟交易"""
+        conn = self.get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO one_night_trades (
+                    symbol, name, buy_date, buy_price, quantity, amount, fees, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'HOLD')
+            ''', (
+                trade_data['symbol'], trade_data['name'], trade_data['buy_date'],
+                trade_data['buy_price'], trade_data['quantity'], trade_data['amount'],
+                trade_data.get('fees', 0.0)
+            ))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def close_trade(self, trade_id: int, sell_data: dict):
+        """平仓交易"""
+        conn = self.get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE one_night_trades 
+                SET sell_date = ?, sell_price = ?, sell_amount = ?, 
+                    pnl = ?, pnl_pct = ?, fees = fees + ?, status = 'SOLD'
+                WHERE id = ?
+            ''', (
+                sell_data['sell_date'], sell_data['sell_price'], sell_data['sell_amount'],
+                sell_data['pnl'], sell_data['pnl_pct'], sell_data.get('sell_fees', 0.0),
+                trade_id
+            ))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_active_trades(self):
+        """获取当前持仓"""
+        conn = self.get_connection()
+        try:
+            return pd.read_sql_query("SELECT * FROM one_night_trades WHERE status = 'HOLD'", conn)
+        finally:
+            conn.close()
+
+    def get_trade_history(self, limit: int = 50):
+        """获取历史交易记录"""
+        conn = self.get_connection()
+        try:
+            return pd.read_sql_query(f"SELECT * FROM one_night_trades ORDER BY created_at DESC LIMIT {limit}", conn)
         finally:
             conn.close()
     

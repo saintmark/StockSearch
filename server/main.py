@@ -9,6 +9,7 @@ from database import DatabaseManager
 from industry_matcher import IndustryMatcher
 from news_time_decay import NewsTimeDecay
 from backtest_evaluator import BacktestEvaluator
+from one_night_strategy import OneNightStrategy
 import datetime
 import asyncio
 import threading
@@ -34,6 +35,7 @@ backtest_evaluator = BacktestEvaluator(
     max_hold_days=30,
     fixed_periods=[5, 10, 20, 30]
 )
+one_night_strategy = OneNightStrategy(fetcher, db)
 
 # 允许跨域请求
 app.add_middleware(
@@ -145,6 +147,45 @@ class NewsScanner:
                 print(f"[NewsScanner] Error in loop: {e}")
                 time.sleep(60)
 
+class StrategyScheduler:
+    """策略定时调度器"""
+    def __init__(self, strategy):
+        self.strategy = strategy
+        self.is_running = True
+        self.last_buy_date = None
+        self.last_sell_date = None
+
+    def run_loop(self):
+        print("[Scheduler] Strategy Scheduler Thread Started.")
+        while self.is_running:
+            try:
+                now = datetime.datetime.now() # Server local time
+                # 修正：Railway 容器通常是 UTC 时间，需转换为北京时间（UTC+8）
+                # 注意：docker容器里 datetime.now() 可能是 UTC
+                # 最好统一用 UTC+8 判断
+                utc_now = datetime.datetime.utcnow()
+                beijing_now = utc_now + datetime.timedelta(hours=8)
+                
+                current_date_str = beijing_now.strftime("%Y-%m-%d")
+                current_time_str = beijing_now.strftime("%H:%M")
+                
+                # Check Sell (09:40)
+                if current_time_str == "09:40" and self.last_sell_date != current_date_str:
+                    print(f"[Scheduler] Triggering Daily Sell Routine at {current_time_str}...")
+                    self.strategy.daily_sell_routine()
+                    self.last_sell_date = current_date_str
+                
+                # Check Buy (14:30)
+                if current_time_str == "14:30" and self.last_buy_date != current_date_str:
+                    print(f"[Scheduler] Triggering Daily Buy Routine at {current_time_str}...")
+                    self.strategy.daily_buy_routine()
+                    self.last_buy_date = current_date_str
+                
+                time.sleep(30) # Check every 30s
+            except Exception as e:
+                print(f"[Scheduler] Error: {e}")
+                time.sleep(60)
+
 class BackgroundScanner:
     """后台异步扫描引擎：负责全市场自动寻迹"""
     def __init__(self, fetcher, engine, db):
@@ -196,159 +237,24 @@ class BackgroundScanner:
                     else:
                         continue
     
-                self.scan_count += 1
                 print(f"\n[Scanner] === Starting FULL-MARKET Scan #{self.scan_count} ({today_str}) ===")
-                    
-                # 1. 获取全市场标的快照
-                full_spot = self.fetcher.get_realtime_quotes([])
-                if full_spot.empty:
-                    print("[Scanner] Warning: Could not fetch market spot. Retrying in 60s...")
-                    time.sleep(60)
-                    continue
-                    
-                # 过滤垃圾股
-                valid_spot = full_spot[full_spot['成交额'] > 5000000] # 500w 以上成交额
-                all_symbols = valid_spot['代码'].tolist()
-                print(f"[Scanner] Market snapshot loaded. Analyzing {len(all_symbols)} active candidates.")
-    
-                new_recommendations = []
-                weights = self.db.get_weights()
                 
-                # 从数据库获取最新新闻池用于辅助打分 (Read-Only)
-                news_pool = []
-                try:
-                    db_news = self.db.get_latest_news(limit=100, max_age_days=3)
-                    for dn in db_news:
-                         news_pool.append({
-                             "content": dn['content'],
-                             "title": dn['title'], 
-                             "time": dn.get('time', ''),
-                             "sentiment": dn['sentiment'],
-                             "created_at": dn.get('created_at', '')
-                         })
-                    news_pool = time_decay.filter_news_by_age(news_pool)
-                    print(f"[Scanner] Loaded {len(news_pool)} valid news items for context awareness.")
-                except Exception as e:
-                    print(f"[Scanner] Error loading news from DB: {e}")
+                # 改用 OneNightStrategy 的扫描逻辑
+                new_recommendations = one_night_strategy.scan_market()
                 
-                def process_stock(symbol):
-                    try:
-                        # 稳压：增加微小随机延迟，防止并发请求过快被数据源封锁
-                        import random
-                        time.sleep(0.1 + random.random() * 0.3)
-                
-                        # 1. 尝试从缓存或网络获取日线 (核心必需)
-                        kline = self.db.get_cached_kline(symbol)
-                        if kline is None:
-                            kline = self.fetcher.get_kline_data(symbol, days=150)
-                            if kline is not None and not kline.empty:
-                                self.db.save_kline(symbol, kline)
-                                        
-                        if kline is None or kline.empty: 
-                            return None
-                                        
-                        # 2. 快速过滤：先进行简单的技术面预判
-                        # 如果技术得分极低，说明该股处于深跌或横盘，不值得进一步抓取周线和财务数据
-                        temp_rec = self.engine.generate_recommendation(kline, sentiment_score=0.0)
-                        if temp_rec.get('action') == 'WAIT' and temp_rec.get('score', 0) < 40:
-                            # 即使是 WAIT，也返回结果以便入库排序，但节省了 2 次昂贵的网络请求
-                            stock_info = self.db.get_cached_stock_info(symbol)
-                            temp_rec.update({
-                                'symbol': symbol,
-                                'name': stock_info.get('股票简称', symbol) if stock_info else symbol,
-                                'price': float(temp_rec.get('price', 0)),
-                                'industry': stock_info.get('行业', '未知') if stock_info else '未知'
-                            })
-                            return temp_rec
-                
-                        # 3. 只有“潜力股”才进行深度抓取 (周线 + 财务)
-                        stock_info = self.db.get_cached_stock_info(symbol)
-                        if not stock_info:
-                            stock_info = self.fetcher.get_stock_info(symbol)
-                            if stock_info:
-                                self.db.save_stock_info(symbol, stock_info)
-                                        
-                        stock_name = stock_info.get('股票简称', symbol) if stock_info else symbol
-                        stock_industry = stock_info.get('行业', '未知') if stock_info else '未知'
-                                        
-                        # 获取深度维度数据
-                        weekly_kline = None
-                        try:
-                            weekly_kline = self.fetcher.get_kline_data(symbol, period="weekly", days=200)
-                        except: pass
-                                        
-                        finance_data = None
-                        try:
-                            finance_list = self.fetcher.get_company_finance(symbol)
-                            if finance_list: finance_data = finance_list[0]
-                        except: pass
-                                        
-                        # 情感匹配 (基于已有的 news_pool)
-                        dynamic_sent = 0.0
-                        if news_pool:
-                            matching_news = industry_matcher.get_matching_news(
-                                news_pool, stock_industry=stock_industry,
-                                stock_name=stock_name, symbol=symbol
-                            )
-                            if matching_news:
-                                dynamic_sent = industry_matcher.calculate_sentiment_score(
-                                    matching_news, time_decay_handler=time_decay
-                                )
-                                dynamic_sent = max(-1.0, min(1.0, dynamic_sent))
-                
-                        # 4. 生成最终深度推荐
-                        rec = self.engine.generate_recommendation(
-                            kline, dynamic_sent,
-                            tech_weight=weights.get('tech_weight', 0.6),
-                            sentiment_weight=weights.get('sentiment_weight', 0.2),
-                            fundamental_weight=weights.get('fundamental_weight', 0.15),
-                            risk_weight=weights.get('risk_weight', 0.05),
-                            finance_data=finance_data,
-                            weekly_kline_df=weekly_kline
-                        )
-                                        
-                        rec.update({
-                            'symbol': symbol,
-                            'name': stock_name,
-                            'price': float(rec.get('price', 0)),
-                            'industry': stock_industry,
-                            'change': float(stock_info.get('涨跌幅', 0)) if stock_info else 0.0,
-                            'turnover': float(stock_info.get('换手率', 0)) if stock_info else 0.0
-                        })
-                                        
-                        if rec['action'] in ["BUY", "HOLD"]:
-                            self.db.save_recommendation(rec)
-                                        
-                        return rec
-                    except Exception as e:
-                        return None
-                
-                # 2. 并发深度扫描
-                max_workers = 3
-                print(f"[Scanner] Starting Evaluation with {max_workers} concurrent workers...")
-                with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    futures = {executor.submit(process_stock, sym): sym for sym in all_symbols}
-                    done_count = 0
-                    for future in concurrent.futures.as_completed(futures):
-                        res = future.result()
-                        if res:
-                            new_recommendations.append(res)
-                            
-                        done_count += 1
-                        if done_count % 50 == 0 or done_count == len(all_symbols):
-                            print(f"[Scanner] Progress: {done_count}/{len(all_symbols)} evaluated ({(done_count/len(all_symbols)*100):.1f}%)...")
-    
-                # 3. 更新内存缓存 (按评分排序，取前 12 个)
                 if not new_recommendations:
-                    print("[Scanner] Warning: All evaluations failed. Results empty.")
+                    print("[Scanner] Warning: Strategy scan returned empty list.")
                     self.latest_results = []
                 else:
-                    full_ranks = sorted(new_recommendations, key=lambda x: x['score'], reverse=True)
-                    self.latest_results = full_ranks[:12]
+                    # 按分数 (量比) 排序
+                    full_ranks = sorted(new_recommendations, key=lambda x: x.get('score', 0), reverse=True)
+                    self.latest_results = full_ranks[:12] # 主页显示 Top 12 (其实所有符合条件的都是推荐)
                     self.last_scan_date = today_str 
-                    self.db.save_daily_scan(today_str, full_ranks)
-                    print(f"[Scanner] Full Scan Complete. Saved {len(full_ranks)} stocks to Database.")
                     
+                    # 将全部结果存入数据库供排行榜分页查阅
+                    self.db.save_daily_scan(today_str, full_ranks)
+                    print(f"[Scanner] Full Scan Complete. Saved {len(full_ranks)} stocks to Database for Market Ranking.")
+                
                 self.reset_event.clear()
             except Exception as e:
                 print(f"[Scanner] Critical Error in Loop: {e}")
@@ -379,7 +285,13 @@ threading.Thread(target=scanner.scan_loop, daemon=True).start()
 
 # 启动独立的新闻扫描引擎
 news_scanner = NewsScanner(db, analyzer)
+# 启动独立的新闻扫描引擎
+news_scanner = NewsScanner(db, analyzer)
 threading.Thread(target=news_scanner.scan_loop, daemon=True).start()
+
+# 启动策略调度器
+strategy_scheduler = StrategyScheduler(one_night_strategy)
+threading.Thread(target=strategy_scheduler.run_loop, daemon=True).start()
 
 @app.get("/")
 async def root():
@@ -706,6 +618,31 @@ def trigger_manual_scan():
         return {"status": "success", "message": "Full market scan triggered. Please wait 5-10 minutes for completion."}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+@app.get("/api/strategy/onenight/status")
+def get_onenight_status():
+    """获取一夜持股策略当前状态 (持仓)"""
+    active_trades = db.get_active_trades()
+    return active_trades.to_dict(orient="records")
+
+@app.get("/api/strategy/onenight/history")
+def get_onenight_history():
+    """获取一夜持股策略历史战绩"""
+    history = db.get_trade_history(limit=100)
+    return history.to_dict(orient="records")
+
+@app.post("/api/strategy/onenight/trigger_buy")
+def trigger_onenight_buy():
+    """【测试用】手动触发买入逻辑"""
+    threading.Thread(target=one_night_strategy.daily_buy_routine).start()
+    return {"status": "triggered", "message": "Buy routine started in background."}
+
+@app.post("/api/strategy/onenight/trigger_sell")
+def trigger_onenight_sell():
+    """【测试用】手动触发卖出逻辑"""
+    threading.Thread(target=one_night_strategy.daily_sell_routine).start()
+    return {"status": "triggered", "message": "Sell routine started in background."}
+
 
 @app.get("/api/review/performance")
 def get_performance_review():
