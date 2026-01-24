@@ -20,22 +20,39 @@ class OneNightStrategy:
         stamp_duty = amount * self.stamp_duty_rate if not is_buy else 0
         return commission + stamp_duty
 
-    def check_limit_up_history(self, symbol: str, lookback_days: int = 20) -> bool:
+    def check_limit_up_history(self, symbol: str, lookback_days: int = 20, cache_only: bool = True) -> bool:
         """
         检查过去 N 天内是否有过涨停
         涨停定义：日涨幅 > 9.5% (简单判定，涵盖主板10%和科创/创业20%)
+        
+        Args:
+            cache_only: 如果为 True，则只使用缓存数据，不发起网络请求（推荐）
         """
         try:
-            # 多取几天防止休市日影响
-            df = self.fetcher.get_kline_data(symbol, days=lookback_days + 10)
-            if df.empty:
-                return False
+            # 从数据库缓存读取
+            df = self.db.get_cached_kline(symbol, max_age_hours=48)  # 2天内的缓存都可用
+            
+            if df is None or df.empty:
+                if cache_only:
+                    # 强制缓存模式：没有缓存就直接跳过，不发起网络请求
+                    return False
+                else:
+                    # 允许网络请求模式（仅在特殊情况下使用）
+                    delay = 1.0 + random.random() * 2.0
+                    print(f"[Strategy] Cache miss for {symbol}, fetching with {delay:.1f}s delay...")
+                    time.sleep(delay)
+                    
+                    df = self.fetcher.get_kline_data(symbol, days=lookback_days + 10)
+                    
+                    if df is not None and not df.empty:
+                        self.db.save_kline(symbol, df)
+                    else:
+                        return False
             
             # 取最近 N 天 (切片)
             df = df.tail(lookback_days)
             
             # 检查是否有涨幅 > 9.5%
-            # 注意：akshare 返回的涨跌幅是 float (例如 10.02)
             has_limit_up = (df['涨跌幅'] > 9.5).any()
             return has_limit_up
         except Exception as e:
@@ -87,18 +104,19 @@ class OneNightStrategy:
         
         final_candidates = []
         
-        # 限制检查数量，如果只需要 Top N，这里可以做限制
-        # 用户需求是“所有选出来的”，所以理想情况下应该全查。
-        # 但为了性能，我们设定一个较大的上限，比如 100 (通常每天符合初筛的不会太多)
-        max_check = 100 
+        # 💡 使用缓存后速度极快，可以检查更多股票
+        # 如果缓存已建立，整个过程只需 10-30 秒
+        max_check = min(100, len(potential_stocks)) 
         check_count = 0
+        
+        print(f"[OneNight] Checking limit-up history for top {max_check} candidates (cache-only mode)...")
         
         for symbol in potential_stocks:
             if check_count >= max_check: 
                 break
                 
             if progress_callback:
-                progress_callback(check_count, len(potential_stocks))
+                progress_callback(check_count, max_check)
                 
             if self.check_limit_up_history(symbol):
                 # 获取该股完整信息
@@ -122,8 +140,7 @@ class OneNightStrategy:
                 }
                 final_candidates.append(rec)
             
-            check_count += 1
-            time.sleep(0.05) # 加快一点速度
+            check_count += 1 
             
         print(f"[OneNight] Full scan complete. Found {len(final_candidates)} candidates.")
         return final_candidates

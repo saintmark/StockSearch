@@ -104,7 +104,7 @@ class NewsScanner:
                 
                 # 3. 持久化到数据库
                 # 修正：Railway 容器通常是 UTC 时间，需转换为北京时间（UTC+8）
-                utc_now = datetime.datetime.utcnow()
+                utc_now = datetime.datetime.now(datetime.timezone.utc)
                 beijing_now = utc_now + datetime.timedelta(hours=8)
                 current_date = beijing_now.date()
                 
@@ -163,7 +163,8 @@ class StrategyScheduler:
                 # 修正：Railway 容器通常是 UTC 时间，需转换为北京时间（UTC+8）
                 # 注意：docker容器里 datetime.now() 可能是 UTC
                 # 最好统一用 UTC+8 判断
-                utc_now = datetime.datetime.utcnow()
+                # 使用时区感知的 UTC 时间（避免 DeprecationWarning）
+                utc_now = datetime.datetime.now(datetime.timezone.utc)
                 beijing_now = utc_now + datetime.timedelta(hours=8)
                 
                 current_date_str = beijing_now.strftime("%Y-%m-%d")
@@ -217,7 +218,7 @@ class BackgroundScanner:
         while self.is_running:
             try:
                 # 修正：Railway 容器通常是 UTC 时间，需转换为北京时间（UTC+8）
-                utc_now = datetime.datetime.utcnow()
+                utc_now = datetime.datetime.now(datetime.timezone.utc)
                 beijing_now = utc_now + datetime.timedelta(hours=8)
                 today_str = beijing_now.strftime("%Y-%m-%d")
                     
@@ -239,7 +240,43 @@ class BackgroundScanner:
     
                 print(f"\n[Scanner] === Starting FULL-MARKET Scan #{self.scan_count} ({today_str}) ===")
                 
-                # 改用 OneNightStrategy 的扫描逻辑
+                # 🔄 阶段 1：先执行全量 K 线缓存（为后续策略提供数据基础）
+                print("[Scanner] Phase 1: Pre-caching K-line data for active stocks...")
+                stock_list = self.fetcher.get_all_stocks()
+                if stock_list.empty:
+                    print("[Scanner] ERROR: Cannot fetch stock list.")
+                    time.sleep(300)
+                    continue
+                
+                # ak.stock_info_a_code_name() 返回的列名是 'code', 'name' (英文)
+                symbols = stock_list['code'].tolist()
+                print(f"[Scanner] Total {len(symbols)} stocks to cache.")
+                
+                # 使用 3 线程并发缓存（不做分析，只存 K 线）
+                from concurrent.futures import ThreadPoolExecutor
+                import random
+                
+                def cache_stock_kline(symbol):
+                    try:
+                        time.sleep(0.1 + random.random() * 0.2)  # 防封延迟
+                        cached = self.db.get_cached_kline(symbol, max_age_hours=48)  # 2天内有效
+                        if cached is None or cached.empty:
+                            kline = self.fetcher.get_kline_data(symbol, days=30)  # 只需 30 天数据
+                            if kline is not None and not kline.empty:
+                                self.db.save_kline(symbol, kline)
+                        return True
+                    except:
+                        return False
+                
+                cached_count = 0
+                with ThreadPoolExecutor(max_workers=3) as executor:
+                    results = list(executor.map(cache_stock_kline, symbols))
+                    cached_count = sum(results)
+                
+                print(f"[Scanner] Phase 1 Complete: {cached_count}/{len(symbols)} stocks cached.")
+                
+                # 🎯 阶段 2：执行“一夜持股”策略筛选（完全依赖缓存）
+                print("[Scanner] Phase 2: Running OneNight strategy with cached data...")
                 new_recommendations = one_night_strategy.scan_market()
                 
                 if not new_recommendations:
@@ -248,43 +285,23 @@ class BackgroundScanner:
                 else:
                     # 按分数 (量比) 排序
                     full_ranks = sorted(new_recommendations, key=lambda x: x.get('score', 0), reverse=True)
-                    self.latest_results = full_ranks[:12] # 主页显示 Top 12 (其实所有符合条件的都是推荐)
+                    self.latest_results = full_ranks[:12] # 主页显示 Top 12
                     self.last_scan_date = today_str 
                     
                     # 将全部结果存入数据库供排行榜分页查阅
                     self.db.save_daily_scan(today_str, full_ranks)
                     print(f"[Scanner] Full Scan Complete. Saved {len(full_ranks)} stocks to Database for Market Ranking.")
                 
+                self.scan_count += 1
                 self.reset_event.clear()
             except Exception as e:
                 print(f"[Scanner] Critical Error in Loop: {e}")
                 time.sleep(60)
 
-                # 3. 更新内存缓存 (按评分排序，取前 12 个)
-                if not new_recommendations:
-                    print("[Scanner] Warning: All evaluations failed. Results empty.")
-                    self.latest_results = []
-                else:
-                    # 将所有评估结果按评分排序
-                    full_ranks = sorted(new_recommendations, key=lambda x: x['score'], reverse=True)
-                    self.latest_results = full_ranks[:12] # 主页依然显示 Top 12
-                    self.last_scan_date = today_str 
-                    # 将全部排序结果存入数据库供排行榜分页查阅
-                    self.db.save_daily_scan(today_str, full_ranks)
-                    print(f"[Scanner] Full Scan Complete. Saved {len(full_ranks)} stocks to Database for Market Ranking.")
-                
-                self.reset_event.clear()
-            except Exception as e:
-                print(f"[Scanner] Critical Error in Loop: {e}")
-                time.sleep(60)
-
-# 初始化并启动后台扫描引擎
 # 初始化并启动后台扫描引擎
 scanner = BackgroundScanner(fetcher, engine, db)
 threading.Thread(target=scanner.scan_loop, daemon=True).start()
 
-# 启动独立的新闻扫描引擎
-news_scanner = NewsScanner(db, analyzer)
 # 启动独立的新闻扫描引擎
 news_scanner = NewsScanner(db, analyzer)
 threading.Thread(target=news_scanner.scan_loop, daemon=True).start()

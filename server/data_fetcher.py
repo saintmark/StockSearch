@@ -100,21 +100,73 @@ class StockDataFetcher:
 
     @staticmethod
     def get_kline_data(symbol: str, period: str = "daily", start_date: str = None, days: int = 200) -> pd.DataFrame:
-        """获取历史 K 线数据"""
-        try:
-            if not start_date:
-                start_date = (datetime.datetime.now() - datetime.timedelta(days=days)).strftime("%Y%m%d")
-            
-            # Print for debugging
-            # print(f"[Fetcher] Fetching K-line for {symbol} from {start_date}")
-            
-            df = ak.stock_zh_a_hist(symbol=symbol, period=period, start_date=start_date, adjust="qfq")
-            if df.empty:
-                print(f"[Fetcher] Warning: K-line data for {symbol} is empty.")
-            return df
-        except Exception as e:
-            print(f"[Fetcher] Error fetching K-line data for {symbol}: {e}")
-            return pd.DataFrame()
+        """获取历史 K 线数据 (带重试机制)"""
+        max_retries = 3
+        retry_delay = 2  # 初始延迟提升到 2 秒
+        
+        for attempt in range(max_retries):
+            try:
+                if not start_date:
+                    start_date = (datetime.datetime.now() - datetime.timedelta(days=days)).strftime("%Y%m%d")
+                
+                # AKShare 接口有时不稳定，尝试捕获 RemoteDisconnected
+                df = ak.stock_zh_a_hist(symbol=symbol, period=period, start_date=start_date, adjust="qfq")
+                if df.empty:
+                    # print(f"[Fetcher] Warning: K-line data for {symbol} is empty.")
+                    pass
+                return df
+            except Exception as e:
+                error_msg = str(e)
+                # 🚨 检测到连接被拒绝，立即进入长时间等待
+                if 'Connection aborted' in error_msg or 'RemoteDisconnected' in error_msg:
+                    print(f"[Fetcher] ⚠️  Connection rejected for {symbol} (Attempt {attempt+1}/{max_retries}). Server may be rate-limiting. Waiting {retry_delay * 2}s...")
+                    time.sleep(retry_delay * 2)  # 双倍延迟
+                
+                # 尝试 Fallback 到 Sina 接口 (ak.stock_zh_a_daily)
+                if attempt == max_retries - 1: # Last attempt, try fallback
+                    try:
+                        # Sina 需要 sh/sz 前缀 (北交소通常是 bj，但Sina接口是否支持需验证。如果不支持，这里会返回空或报错)
+                        prefix = "sh" if symbol.startswith("6") else ("sz" if symbol.startswith(("0", "3")) else "bj")
+                        sina_symbol = f"{prefix}{symbol}" 
+                        
+                        # print(f"[Fetcher] Primary failed. Trying fallback (Sina) for {sina_symbol}...")
+                        df_sina = ak.stock_zh_a_daily(symbol=sina_symbol, start_date=start_date, adjust="qfq")
+                        
+                        if df_sina is not None and not df_sina.empty:
+                            # 检查是否存在 expected columns
+                            if "date" in df_sina.columns:
+                                # 重命名列以匹配 stock_zh_a_hist 格式
+                                df_sina = df_sina.rename(columns={
+                                    "date": "日期", "open": "开盘", "high": "最高", "low": "最低", 
+                                    "close": "收盘", "volume": "成交量", "amount": "成交额",
+                                    "turnover": "换手率"
+                                })
+                                # 计算涨跌幅 (Sina 不直接返回)
+                                if "收盘" in df_sina.columns:
+                                    df_sina['涨跌幅'] = df_sina['收盘'].pct_change() * 100
+                                    # 填充第一天的涨跌幅为0
+                                    df_sina['涨跌幅'] = df_sina['涨跌幅'].fillna(0)
+                                
+                                if "换手率" in df_sina.columns:
+                                    df_sina['换手率'] = df_sina['换手率'] * 100
+                                
+                                return df_sina
+                            else:
+                                pass
+                                # print(f"[Fetcher] Fallback (Sina) return unexpected columns for {symbol}: {df_sina.columns}")
+                    except Exception as ex:
+                        # 静默处理 Fallback 错误，避免刷屏
+                        # print(f"[Fetcher] Fallback (Sina) also failed for {symbol}: {ex}")
+                        pass
+
+                if attempt < max_retries - 1:
+                    print(f"[Fetcher] Error fetching K-line for {symbol} (Attempt {attempt+1}/{max_retries}): {e}. Retrying in {retry_delay}s...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                else:
+                    print(f"[Fetcher] Failed to fetch K-line for {symbol} after {max_retries} attempts & fallback: {e}")
+                    return pd.DataFrame()
+        return pd.DataFrame()
 
     @classmethod
     def get_company_finance(cls, symbol: str) -> List:

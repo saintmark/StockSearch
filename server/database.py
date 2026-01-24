@@ -352,15 +352,39 @@ class DatabaseManager:
         finally:
             conn.close()
 
-    def get_cached_kline(self, symbol: str):
-        """获取本地缓存的 K 线数据（支持压缩存储）"""
+    def get_cached_kline(self, symbol: str, max_age_hours: int = 24):
+        """
+        获取本地缓存的 K 线数据（支持压缩存储）
+        
+        Args:
+            symbol: 股票代码
+            max_age_hours: 缓存最大有效时长（小时），默认 24 小时。如果缓存超过此时间，返回 None
+        """
         conn = self.get_connection()
         try:
             cursor = conn.cursor()
-            cursor.execute("SELECT data_json FROM kline_cache WHERE symbol = ?", (symbol,))
+            # 查询时同时获取 updated_at
+            cursor.execute("SELECT data_json, updated_at FROM kline_cache WHERE symbol = ?", (symbol,))
             row = cursor.fetchone()
             if row:
                 data = row[0]
+                updated_at = row[1]
+                
+                # 检查缓存是否过期
+                if updated_at:
+                    try:
+                        # SQLite 返回的是 UTC 时间字符串
+                        cache_time = datetime.strptime(updated_at, "%Y-%m-%d %H:%M:%S")
+                        # 使用北京时间计算
+                        beijing_now = datetime.utcnow() + timedelta(hours=8)
+                        age_hours = (beijing_now - cache_time).total_seconds() / 3600
+                        
+                        if age_hours > max_age_hours:
+                            # print(f"[Database] Cache expired for {symbol} (age: {age_hours:.1f}h)")
+                            return None
+                    except:
+                        pass  # 如果日期解析失败，仍然返回缓存数据
+                
                 # 尝试解压（如果是压缩数据）
                 try:
                     # 如果是字节类型，尝试解压
@@ -394,9 +418,13 @@ class DatabaseManager:
             json_str = df.to_json(orient='records', date_format='iso')
             # 使用gzip压缩（compresslevel=6是速度和压缩率的平衡）
             compressed_data = gzip.compress(json_str.encode('utf-8'), compresslevel=6)
+            # 使用北京时间作为 updated_at
+            beijing_now = (datetime.utcnow() + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
             # 存储压缩后的数据（SQLite会自动处理BLOB）
-            cursor.execute("INSERT OR REPLACE INTO kline_cache (symbol, data_json) VALUES (?, ?)", 
-                           (symbol, compressed_data))
+            cursor.execute("""
+                INSERT OR REPLACE INTO kline_cache (symbol, data_json, updated_at) 
+                VALUES (?, ?, ?)
+            """, (symbol, compressed_data, beijing_now))
             conn.commit()
         finally:
             conn.close()
