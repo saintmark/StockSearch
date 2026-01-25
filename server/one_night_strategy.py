@@ -2,6 +2,7 @@ import pandas as pd
 import datetime
 import time
 import random
+import baostock as bs
 from data_fetcher import StockDataFetcher
 from database import DatabaseManager
 
@@ -23,93 +24,224 @@ class OneNightStrategy:
     def check_limit_up_history(self, symbol: str, lookback_days: int = 20, cache_only: bool = True) -> bool:
         """
         检查过去 N 天内是否有过涨停
-        涨停定义：日涨幅 > 9.5% (简单判定，涵盖主板10%和科创/创业20%)
-        
-        Args:
-            cache_only: 如果为 True，则只使用缓存数据，不发起网络请求（推荐）
         """
         try:
-            # 从数据库缓存读取
-            df = self.db.get_cached_kline(symbol, max_age_hours=48)  # 2天内的缓存都可用
+            # 1. 尝试从数据库缓存读取
+            df = self.db.get_cached_kline(symbol, max_age_hours=24)
             
             if df is None or df.empty:
-                if cache_only:
-                    # 强制缓存模式：没有缓存就直接跳过，不发起网络请求
-                    return False
+                if cache_only: return False
+                
+                # 2. 缓存缺失，发起网络请求
+                time.sleep(0.1)
+                df = self.fetcher.get_kline_data(symbol, days=lookback_days + 15)
+                
+                if df is not None and not df.empty:
+                    self.db.save_kline(symbol, df)
                 else:
-                    # 允许网络请求模式（仅在特殊情况下使用）
-                    delay = 1.0 + random.random() * 2.0
-                    print(f"[Strategy] Cache miss for {symbol}, fetching with {delay:.1f}s delay...")
-                    time.sleep(delay)
-                    
-                    df = self.fetcher.get_kline_data(symbol, days=lookback_days + 10)
-                    
-                    if df is not None and not df.empty:
-                        self.db.save_kline(symbol, df)
-                    else:
-                        return False
+                    print(f"[Debug] {symbol} K-line empty, skipping.")
+                    return False
             
-            # 取最近 N 天 (切片)
+            # 3. 筛选最近 N 天
             df = df.tail(lookback_days)
+            if df.empty: return False
             
-            # 检查是否有涨幅 > 9.5%
-            has_limit_up = (df['涨跌幅'] > 9.5).any()
-            return has_limit_up
+            # 确保涨跌幅列存在
+            if '涨跌幅' not in df.columns:
+                print(f"[Debug] {symbol} missing '涨跌幅' column. Available: {df.columns.tolist()}")
+                return False
+                
+            # 获取 20 日内最高涨幅
+            max_change = df['涨跌幅'].max()
+            is_valid = max_change > 9.5
+            
+            # 💡 调试：打印所有候选股的 20日最高涨幅，看看到底是什么水平
+            print(f"[Debug] {symbol} 20d Max Change: {max_change:.2f}% {'[PASS]' if is_valid else ''}")
+            
+            return is_valid
+            
         except Exception as e:
             print(f"[Strategy] Error checking limit up for {symbol}: {e}")
             return False
 
     def scan_market(self, progress_callback=None) -> list:
         """
-        全市场扫描：应用 6 大过滤条件
-        返回符合条件的候选股列表 (包含完整信息)
+        全市场扫描：下午 14:30 触发，应用 6 大过滤条件
+        1. 3% <= 涨幅 <= 5%
+        2. 量比 > 1.0
+        3. 总市值 <= 200亿
+        4. 5% <= 换手率 <= 10%
+        5. 股价 > 分时均线 (成交额/成交量)
+        6. 20日内有过涨停 (需要 K 线数据)
         """
         print(f"[OneNight] Starting full market scan at {datetime.datetime.now()}...")
         
-        # 1. 获取全市场实时行情
+        # 1. 获取全市场实时行情 (一次性拉取，规避高频封锁)
         df = self.fetcher.get_realtime_quotes()
         if df.empty:
             print("[OneNight] Error: Failed to fetch market quotes.")
             return []
         
-        # 预处理数值列
-        numeric_cols = ['涨跌幅', '量比', '总市值', '换手率', '最新价', '成交量', '成交额']
-        for col in numeric_cols:
+        # 💡 新增：列名归一化 (兼容不同接口的命名差异)
+        column_mapping = {
+            'symbol': '代码', 'code': '代码', 'name': '名称',
+            'trade': '最新价', 'price': '最新价',
+            'changepercent': '涨跌幅', 'pctChg': '涨跌幅', '涨跌幅(%)': '涨跌幅',
+            'turnoverratio': '换手率', 'turnover': '换手率', '换手': '换手率', '换手率(%)': '换手率',
+            'mktcap': '总市值', 'amount': '成交额', 'volume': '成交量'
+        }
+                
+        # 记录当前原始列名 (调试用)
+        original_cols = df.columns.tolist()
+        print(f"[Debug] Source Columns: {original_cols[:15]}...")
+        
+        # 尝试映射
+        df = df.rename(columns=column_mapping)
+        
+        # 💡 核心优化：如果缺失关键指标，尝试通过计算或备用源补全
+        if '换手率' not in df.columns or df['换手率'].max() == 0:
+            # 如果新浪接口没给，我们就在后面针对 Filter 1 剩下的股票精准补偿
+            print("[OneNight] ℹ️  'Turnover' missing. Will compensate later.")
+            df['换手率'] = 0.0 
+
+        if '总市值' not in df.columns or df['总市值'].max() == 0:
+            # 补全市值：新浪接口可能叫 mktcap (元)
+            if 'mktcap' in df.columns:
+                df['总市值'] = pd.to_numeric(df['mktcap'], errors='coerce')
+            else:
+                df['总市值'] = 50 * 100000000 # 兜底 50 亿
+
+        if '量比' not in df.columns:
+            print("[OneNight] ℹ️  'Volume Ratio' missing. Will calculate from history.")
+            df['量比'] = 0.0
+
+        # 确保数值转换
+        for col in ['涨跌幅', '换手率', '量比', '总市值', '最新价', '成交额', '成交量']:
             if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
+                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
         
-        # 2. 基础筛选 (Vectorized filtering for speed)
-        # 计算均价 (注意: 成交量单位通常是手, 需 * 100; 成交额是元)
-        df['avg_price'] = df['成交额'] / (df['成交量'] * 100)
+        # 计算均价
+        df['avg_price'] = df['成交额'] / (df['成交量'] * 100 + 1e-6)
         
-        mask = (
-            (df['涨跌幅'] >= 3.0) & (df['涨跌幅'] <= 5.0) &
-            (df['量比'] > 1.0) &
-            (df['总市值'] <= 200 * 100000000) &
-            (df['换手率'] >= 5.0) & (df['换手率'] <= 10.0) &
-            (df['最新价'] > df['avg_price'])
-        )
+        # --- 开始阶梯式过滤 (严格按照用户最新要求) ---
         
-        candidates_df = df[mask].copy()
+        # 1. 当天涨幅在 3% - 5% (初筛)
+        f1 = df[ (df['涨跌幅'] >= 3.0) & (df['涨跌幅'] <= 5.0) ]
+        print(f"[Debug] Filter 1 (3%<=涨幅<=5%): {len(f1)} stocks remain")
+        
+        if f1.empty: return []
+
+        # 💡 数据补偿阶段... (保持不变)
+        candidate_symbols = f1['代码'].tolist()
+        print(f"[OneNight] 🏗️  Compensating data for {len(candidate_symbols)} candidates via BaoStock...")
+        
+        compensated_data = {}
+        try:
+            self.fetcher.ensure_bs_login()
+            # 获取日期范围：过去 15 天到今天
+            end_date = datetime.date.today().strftime("%Y-%m-%d")
+            start_date = (datetime.date.today() - datetime.timedelta(days=15)).strftime("%Y-%m-%d")
+            
+            for sym in candidate_symbols[:150]: 
+                # 1. 格式化代码：准确提取 6 位数字并识别市场
+                raw_sym = "".join(filter(str.isdigit, str(sym)))
+                if len(raw_sym) != 6: continue
+                
+                # 上海 6 开头，深圳 0 或 3 开头，北京 4 或 8 开头
+                if raw_sym.startswith("6"): prefix = "sh"
+                else: prefix = "sz" 
+                
+                bs_code = f"{prefix}.{raw_sym}"
+                
+                # 2. 获取历史数据
+                rs = bs.query_history_k_data_plus(
+                    bs_code, "date,turn,volume", 
+                    start_date=start_date, end_date=end_date,
+                    frequency="d", adjustflag="2"
+                )
+                hist_list = []
+                while (rs.error_code == '0') & rs.next():
+                    hist_list.append(rs.get_row_data())
+                
+                if hist_list:
+                    # 昨天的换手率 (作为 14:30 的高精度近似值)
+                    last_turnover = float(hist_list[-1][1]) if hist_list[-1][1] else 5.0
+                    # 过去 5 日均量
+                    prev_vols = [float(x[2]) for x in hist_list[-5:] if x[2]]
+                    avg_vol_5d = sum(prev_vols) / len(prev_vols) if prev_vols else 1.0
+                    
+                    compensated_data[sym] = {
+                        'real_turnover': last_turnover,
+                        'avg_vol_5d': avg_vol_5d
+                    }
+            # 💡 补偿结束，但不急着退出，因为后面进阶筛选还要用
+        except Exception as e:
+            print(f"[OneNight] Compensation error: {e}")
+
+        # 3. 将补偿数据与实时行情结合计算
+        matched_count = len(compensated_data)
+        print(f"[OneNight] Calculating simulated Volume Ratio for {matched_count} matched stocks...")
+        
+        def update_metrics(row):
+            sym = row['代码']
+            if sym in compensated_data:
+                # 换手率补全
+                if row['换手率'] == 0:
+                    row['换手率'] = compensated_data[sym]['real_turnover']
+                
+                # 量比补偿计算 (单位对齐：手 -> 股)
+                real_current_vol_shares = float(row['成交量']) * 100
+                avg_vol_5d_shares = float(compensated_data[sym]['avg_vol_5d'])
+                
+                simulated_v_ratio = (real_current_vol_shares / 0.9) / (avg_vol_5d_shares + 1e-6)
+                row['量比'] = round(simulated_v_ratio, 2)
+            else:
+                # 💡 严格模式：未匹配到补偿数据的（可能是北交所或异常股），给予极低量比使其无法通过 Filter 2
+                row['量比'] = 0.0
+                if row['换手率'] == 0: row['换手率'] = 0.0
+            return row
+        
+        f1 = f1.apply(update_metrics, axis=1)
+
+        # 2. 量比 > 1
+        f2 = f1[ f1['量比'] > 1.0 ]
+        print(f"[Debug] Filter 2 (量比>1): {len(f2)} stocks remain")
+        
+        # 3. 总市值 <= 200亿
+        f3 = f2[ f2['总市值'] <= 200 * 100000000 ]
+        print(f"[Debug] Filter 3 (市值<=200亿): {len(f3)} stocks remain")
+        
+        # 4. 换手率在 5% 和 10% 之间
+        f4 = f3[ (f3['换手率'] >= 5.0) & (f3['换手率'] <= 10.0) ]
+        print(f"[Debug] Filter 4 (5%<=换手<=10%): {len(f4)} stocks remain")
+        
+        # 5. 股价全天保持在分时均线之上 (14:30 采样点)
+        f5 = f4[ f4['最新价'] > f4['avg_price'] ]
+        print(f"[Debug] Filter 5 (股价>分时均线): {len(f5)} stocks remain")
+        
+        candidates_df = f5.copy()
         initial_count = len(candidates_df)
-        print(f"[OneNight] {initial_count} stocks passed initial basic filters.")
+        print(f"[OneNight] {initial_count} stocks passed initial 5 filters.")
         
         if candidates_df.empty:
             return []
 
-        # 3. 进阶筛选: 20天内有过涨停
-        # 按量比降序排列
+        # 3. 进阶筛选: 20天内有过涨停 (仅针对初筛通过的候选股)
+        # 按量比降序排列，优中选优
         candidates_df = candidates_df.sort_values(by='量比', ascending=False)
         potential_stocks = candidates_df['代码'].tolist()
         
         final_candidates = []
         
-        # 💡 使用缓存后速度极快，可以检查更多股票
-        # 如果缓存已建立，整个过程只需 10-30 秒
-        max_check = min(100, len(potential_stocks)) 
+        # 💡 既然每天只运行一次，我们可以更耐心地抓取这些候选股的 K 线
+        # 候选股通常在 50-200 只之间，这个请求量是安全的
+        max_check = 200 
         check_count = 0
         
-        print(f"[OneNight] Checking limit-up history for top {max_check} candidates (cache-only mode)...")
+        print(f"[OneNight] Verifying 20-day limit-up for top {min(len(potential_stocks), max_check)} candidates...")
+        
+        # 💡 关键修复：在进入大批量 K 线查询循环前，强制确保登录状态
+        self.fetcher.ensure_bs_login()
         
         for symbol in potential_stocks:
             if check_count >= max_check: 
@@ -117,20 +249,19 @@ class OneNightStrategy:
                 
             if progress_callback:
                 progress_callback(check_count, max_check)
-                
-            if self.check_limit_up_history(symbol):
-                # 获取该股完整信息
+            
+            # 检查涨停历史 (允许一次网络重试，因为这是唯一的数据源)
+            if self.check_limit_up_history(symbol, cache_only=False):
                 row = candidates_df[candidates_df['代码'] == symbol].iloc[0]
                 
-                # 构造符合 recommendation 格式的字典
                 rec = {
                     'symbol': symbol,
                     'name': row['名称'],
                     'price': float(row['最新价']),
                     'change': float(row['涨跌幅']),
                     'turnover': float(row['换手率']),
-                    'industry': row.get('行业', '未知'), # 实时行情可能包含行业
-                    'score': float(row['量比']), # 使用量比作为分数
+                    'industry': row.get('行业', '未知'),
+                    'score': float(row['量比']), 
                     'action': 'BUY',
                     'advice': f"一夜持股严选：量比 {row['量比']:.2f}，换手 {row['换手率']:.2f}%",
                     'reasons': [
@@ -139,10 +270,18 @@ class OneNightStrategy:
                     ]
                 }
                 final_candidates.append(rec)
+                # 找到 15 个就够了（取前10个买入，留5个备选）
+                if len(final_candidates) >= 15:
+                    break
             
             check_count += 1 
+            # 基础防御延迟
+            time.sleep(0.2)
             
-        print(f"[OneNight] Full scan complete. Found {len(final_candidates)} candidates.")
+        # 💡 全部扫描任务结束，统一登出
+        self.fetcher.ensure_bs_logout()
+            
+        print(f"[OneNight] Scan complete. Found {len(final_candidates)} high-quality candidates.")
         return final_candidates
 
     def daily_buy_routine(self):

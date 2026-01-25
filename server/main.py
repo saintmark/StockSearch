@@ -147,168 +147,88 @@ class NewsScanner:
                 print(f"[NewsScanner] Error in loop: {e}")
                 time.sleep(60)
 
-class StrategyScheduler:
-    """策略定时调度器"""
-    def __init__(self, strategy):
-        self.strategy = strategy
-        self.is_running = True
-        self.last_buy_date = None
-        self.last_sell_date = None
-
-    def run_loop(self):
-        print("[Scheduler] Strategy Scheduler Thread Started.")
-        while self.is_running:
-            try:
-                now = datetime.datetime.now() # Server local time
-                # 修正：Railway 容器通常是 UTC 时间，需转换为北京时间（UTC+8）
-                # 注意：docker容器里 datetime.now() 可能是 UTC
-                # 最好统一用 UTC+8 判断
-                # 使用时区感知的 UTC 时间（避免 DeprecationWarning）
-                utc_now = datetime.datetime.now(datetime.timezone.utc)
-                beijing_now = utc_now + datetime.timedelta(hours=8)
-                
-                current_date_str = beijing_now.strftime("%Y-%m-%d")
-                current_time_str = beijing_now.strftime("%H:%M")
-                
-                # Check Sell (09:40)
-                if current_time_str == "09:40" and self.last_sell_date != current_date_str:
-                    print(f"[Scheduler] Triggering Daily Sell Routine at {current_time_str}...")
-                    self.strategy.daily_sell_routine()
-                    self.last_sell_date = current_date_str
-                
-                # Check Buy (14:30)
-                if current_time_str == "14:30" and self.last_buy_date != current_date_str:
-                    print(f"[Scheduler] Triggering Daily Buy Routine at {current_time_str}...")
-                    self.strategy.daily_buy_routine()
-                    self.last_buy_date = current_date_str
-                
-                time.sleep(30) # Check every 30s
-            except Exception as e:
-                print(f"[Scheduler] Error: {e}")
-                time.sleep(60)
-
 class BackgroundScanner:
-    """后台异步扫描引擎：负责全市场自动寻迹"""
-    def __init__(self, fetcher, engine, db):
+    """后台扫描引擎：按照用户需求精确调度（09:40 卖，14:30 买）"""
+    def __init__(self, fetcher, engine, db, strategy):
         self.fetcher = fetcher
         self.engine = engine
         self.db = db
+        self.strategy = strategy
         self.latest_results = []
         self.is_running = True
-        self.scan_count = 0
-        self.last_scan_date = "" 
+        self.last_buy_date = ""
+        self.last_sell_date = ""
         self.reset_event = threading.Event()
 
-        # 启动自检：尝试从数据库恢复今日已有的扫描快照
-        today_str = datetime.date.today().strftime("%Y-%m-%d")
+        # 启动自检：恢复今日已有的扫描快照
+        utc_now = datetime.datetime.now(datetime.timezone.utc)
+        beijing_now = utc_now + datetime.timedelta(hours=8)
+        today_str = beijing_now.strftime("%Y-%m-%d")
+        
         historical_results = self.db.get_daily_scan(today_str)
         if historical_results:
-            print(f"[Scanner] Startup: Restored {len(historical_results)} results for {today_str} from database.")
             self.latest_results = historical_results
-            self.last_scan_date = today_str
+            self.last_buy_date = today_str
 
     def trigger_scan(self):
-        """手动外部唤醒扫描 (如权重变更后)，重置日期强制重扫"""
-        print("[Scanner] Signal received: Resetting date and triggering immediate FULL-MARKET re-scan...")
-        self.last_scan_date = "" 
+        """手动强制重扫"""
+        self.last_buy_date = "" 
         self.reset_event.set()
 
     def scan_loop(self):
-        print("[Scanner] Background Full-Market Scanner Thread Started.")
+        print("[Scanner] Optimized Daily Strategy Thread Started.")
         while self.is_running:
             try:
-                # 修正：Railway 容器通常是 UTC 时间，需转换为北京时间（UTC+8）
                 utc_now = datetime.datetime.now(datetime.timezone.utc)
                 beijing_now = utc_now + datetime.timedelta(hours=8)
                 today_str = beijing_now.strftime("%Y-%m-%d")
-                    
-                # 如果今天已经扫过了，且没有收到强制重扫信号，就进入长休眠
-                if self.last_scan_date == today_str:
-                    print(f"[Scanner] Today's scan ({today_str}) already complete. Waiting for reset or next day...")
-                    if self.reset_event.wait(3600): # 每小时检查一次，除非被 reset_event 唤醒
-                         print("[Scanner] Manual trigger detected. Restarting scan...")
-                    self.reset_event.clear()
-                    continue
-    
-                # 修正：跨天后必须等到收盘后 (15:00) 才能获取当日全量数据
-                if beijing_now.hour < 15 and not self.reset_event.is_set():
-                    print(f"[Scanner] It's {beijing_now.strftime('%H:%M')} (CN Time), market not closed yet. Waiting for 15:00...")
-                    if self.reset_event.wait(1800): # 每 30 分钟检查一次
-                        print("[Scanner] Manual trigger detected. Force starting scan...")
-                    else:
-                        continue
-    
-                print(f"\n[Scanner] === Starting FULL-MARKET Scan #{self.scan_count} ({today_str}) ===")
+                time_str = beijing_now.strftime("%H:%M")
                 
-                # 🔄 阶段 1：先执行全量 K 线缓存（为后续策略提供数据基础）
-                print("[Scanner] Phase 1: Pre-caching K-line data for active stocks...")
-                stock_list = self.fetcher.get_all_stocks()
-                if stock_list.empty:
-                    print("[Scanner] ERROR: Cannot fetch stock list.")
-                    time.sleep(300)
-                    continue
-                
-                # ak.stock_info_a_code_name() 返回的列名是 'code', 'name' (英文)
-                symbols = stock_list['code'].tolist()
-                print(f"[Scanner] Total {len(symbols)} stocks to cache.")
-                
-                # 使用 3 线程并发缓存（不做分析，只存 K 线）
-                from concurrent.futures import ThreadPoolExecutor
-                import random
-                
-                def cache_stock_kline(symbol):
-                    try:
-                        time.sleep(0.1 + random.random() * 0.2)  # 防封延迟
-                        cached = self.db.get_cached_kline(symbol, max_age_hours=48)  # 2天内有效
-                        if cached is None or cached.empty:
-                            kline = self.fetcher.get_kline_data(symbol, days=30)  # 只需 30 天数据
-                            if kline is not None and not kline.empty:
-                                self.db.save_kline(symbol, kline)
-                        return True
-                    except:
-                        return False
-                
-                cached_count = 0
-                with ThreadPoolExecutor(max_workers=3) as executor:
-                    results = list(executor.map(cache_stock_kline, symbols))
-                    cached_count = sum(results)
-                
-                print(f"[Scanner] Phase 1 Complete: {cached_count}/{len(symbols)} stocks cached.")
-                
-                # 🎯 阶段 2：执行“一夜持股”策略筛选（完全依赖缓存）
-                print("[Scanner] Phase 2: Running OneNight strategy with cached data...")
-                new_recommendations = one_night_strategy.scan_market()
-                
-                if not new_recommendations:
-                    print("[Scanner] Warning: Strategy scan returned empty list.")
-                    self.latest_results = []
-                else:
-                    # 按分数 (量比) 排序
-                    full_ranks = sorted(new_recommendations, key=lambda x: x.get('score', 0), reverse=True)
-                    self.latest_results = full_ranks[:12] # 主页显示 Top 12
-                    self.last_scan_date = today_str 
-                    
-                    # 将全部结果存入数据库供排行榜分页查阅
-                    self.db.save_daily_scan(today_str, full_ranks)
-                    print(f"[Scanner] Full Scan Complete. Saved {len(full_ranks)} stocks to Database for Market Ranking.")
-                
-                self.scan_count += 1
-                self.reset_event.clear()
+                # 1. 【上午 09:40】 卖出逻辑 (清空手里股票)
+                if time_str >= "09:40" and time_str < "10:30" and self.last_sell_date != today_str:
+                    # 检查是否为交易日（简单判断：周六日跳过）
+                    if beijing_now.weekday() < 5:
+                        print(f"[Scanner] {time_str} - Triggering Daily SELL Routine...")
+                        self.strategy.daily_sell_routine()
+                        self.last_sell_date = today_str
+                        print("[Scanner] SELL complete. Market review will be updated on next dashboard refresh.")
+
+                # 2. 【下午 14:30】 买入逻辑 (获取全盘数据、分析、筛选、买入)
+                if (time_str >= "14:30" and time_str < "15:00" and self.last_buy_date != today_str) or self.reset_event.is_set():
+                    if beijing_now.weekday() < 5 or self.reset_event.is_set():
+                        print(f"[Scanner] {time_str} - Triggering Daily BUY Routine (Full Market Scan)...")
+                        
+                        # 执行扫描分析 (已经包含了6大过滤策略)
+                        results = self.strategy.scan_market()
+                        
+                        if results:
+                            self.latest_results = results
+                            # 保存快照到数据库
+                            self.db.save_daily_scan(today_str, results)
+                            
+                            # 执行模拟买入 (前10名)
+                            self.strategy.daily_buy_routine()
+                            print(f"[Scanner] BUY complete. Selected {min(10, len(results))} stocks.")
+                        else:
+                            print("[Scanner] Warning: No stocks matched strategy today.")
+                            self.latest_results = []
+                        
+                        self.last_buy_date = today_str
+                        self.reset_event.clear()
+
+                # 每分钟检查一次
+                time.sleep(60)
             except Exception as e:
-                print(f"[Scanner] Critical Error in Loop: {e}")
+                print(f"[Scanner] Error in loop: {e}")
                 time.sleep(60)
 
 # 初始化并启动后台扫描引擎
-scanner = BackgroundScanner(fetcher, engine, db)
+scanner = BackgroundScanner(fetcher, engine, db, one_night_strategy)
 threading.Thread(target=scanner.scan_loop, daemon=True).start()
 
 # 启动独立的新闻扫描引擎
 news_scanner = NewsScanner(db, analyzer)
 threading.Thread(target=news_scanner.scan_loop, daemon=True).start()
-
-# 启动策略调度器
-strategy_scheduler = StrategyScheduler(one_night_strategy)
-threading.Thread(target=strategy_scheduler.run_loop, daemon=True).start()
 
 @app.get("/")
 async def root():
@@ -327,9 +247,21 @@ def get_realtime_stocks(symbols: Optional[str] = Query(None)):
 
 @app.get("/api/stocks/kline/{symbol}")
 def get_stock_kline(symbol: str, period: str = "daily", days: int = 200):
-    """获取 K 线历史数据"""
+    """获取 K 线历史数据 (带缓存支持)"""
+    # 1. 尝试从数据库读取
+    if period == "daily":
+        cached = db.get_cached_kline(symbol, max_age_hours=12)
+        if cached is not None and not cached.empty:
+            return cached.to_dict(orient="records")
+            
+    # 2. 缓存失效或非日线，则从网络获取
     start_date = (datetime.datetime.now() - datetime.timedelta(days=days)).strftime("%Y%m%d")
     df = fetcher.get_kline_data(symbol, period=period, start_date=start_date)
+    
+    # 3. 顺便存入缓存
+    if not df.empty and period == "daily":
+        db.save_kline(symbol, df)
+        
     return df.to_dict(orient="records")
 
 @app.get("/api/stocks/info/{symbol}")
@@ -439,9 +371,17 @@ def get_news_flash():
 
 @app.get("/api/stocks/recommend/{symbol}")
 def get_stock_recommendation(symbol: str):
-    """【单股诊断】获取指定个股的核心策略建议并持久化记录"""
+    """【单股诊断】获取指定个股的核心策略建议 (带缓存支持)"""
     try:
-        kline_df = fetcher.get_kline_data(symbol, days=250)
+        # 1. 尝试从数据库读取 K 线缓存
+        kline_df = db.get_cached_kline(symbol, max_age_hours=12)
+        
+        # 2. 若无缓存则拉取
+        if kline_df is None or kline_df.empty:
+            kline_df = fetcher.get_kline_data(symbol, days=250)
+            if not kline_df.empty:
+                db.save_kline(symbol, kline_df)
+                
         if kline_df.empty:
             return {"error": f"无法获取股票 {symbol} 的数据"}
             
@@ -712,7 +652,13 @@ def get_performance_review():
                         # 获取当前action（重新评估）
                         current_action = None
                         try:
-                            kline_df = fetcher.get_kline_data(symbol, days=150)
+                            # 1. 优先使用缓存
+                            kline_df = db.get_cached_kline(symbol, max_age_hours=24)
+                            if kline_df is None or kline_df.empty:
+                                kline_df = fetcher.get_kline_data(symbol, days=150)
+                                if not kline_df.empty:
+                                    db.save_kline(symbol, kline_df)
+                                    
                             if not kline_df.empty:
                                 # 重新生成推荐，获取当前action
                                 temp_rec = engine.generate_recommendation(kline_df, sentiment_score=0.0)

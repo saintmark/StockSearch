@@ -1,4 +1,5 @@
 import akshare as ak
+import baostock as bs
 import pandas as pd
 from typing import List, Dict, Optional
 import datetime
@@ -12,10 +13,68 @@ class StockDataFetcher:
     _spot_cache = None
     _last_spot_time = 0
     _cache_duration = 43200 # 缓存 12 小时 (盘后锁定，规避重复抓取)
+    
+    # 东方财富接口可用性熔断机制
+    _em_available = True
+    _last_probe_time = 0
+    _probe_interval = 3600 # 1小时检查一次健康度
+
+    # BaoStock 会话管理
+    _bs_logged_in = False
 
     def __init__(self):
         pass
     
+    @classmethod
+    def ensure_bs_login(cls):
+        """确保 BaoStock 已登录，避免重复登录开销"""
+        if not cls._bs_logged_in:
+            lg = bs.login()
+            if lg.error_code == '0':
+                cls._bs_logged_in = True
+        return cls._bs_logged_in
+
+    @classmethod
+    def ensure_bs_logout(cls):
+        """显式登出 (谨慎使用，仅在长任务结束时调用)"""
+        try:
+            if cls._bs_logged_in:
+                bs.logout()
+                cls._bs_logged_in = False
+        except:
+            pass
+    
+    @classmethod
+    def probe_em_health(cls):
+        """
+        前置探针：通过获取 000001 的数据测试东方财富接口是否可用。
+        """
+        current_time = time.time()
+        # 如果距离上次检查不足 1 小时且已知不可用，则维持现状
+        if not cls._em_available and (current_time - cls._last_probe_time < cls._probe_interval):
+            return False
+            
+        print("[Fetcher] 🏥 Probing EastMoney (EM) interface health with '000001'...")
+        cls._last_probe_time = current_time
+        
+        success = False
+        for i in range(3): # 尝试 3 次
+            try:
+                # 快速请求，不带复杂重试逻辑
+                df = ak.stock_zh_a_hist(symbol="000001", period="daily", start_date="20240101", adjust="qfq")
+                if not df.empty:
+                    success = True
+                    break
+            except Exception:
+                time.sleep(1)
+        
+        cls._em_available = success
+        if not success:
+            print("[Fetcher] 🚨 EastMoney probe FAILED. Circuit broken. Switching to Fallback sources.")
+        else:
+            print("[Fetcher] ✅ EastMoney probe PASSED. Using EM as primary source.")
+        return success
+
     @classmethod
     def _load_or_fetch_spot_cache(cls):
         """Helper to load spot cache from memory/disk or fetch from network."""
@@ -44,8 +103,27 @@ class StockDataFetcher:
 
         # 3. 实在没有或过期，发起网络请求
         print("[Fetcher] Spot cache expired or not found. Fetching fresh data...")
-        cls._spot_cache = ak.stock_zh_a_spot_em()
-        cls._last_spot_time = current_time
+        try:
+            cls._spot_cache = ak.stock_zh_a_spot_em()
+            cls._last_spot_time = current_time
+        except Exception as e:
+            print(f"[Fetcher] Error fetching spot data: {e}. Attempting rich fallback (Sina)...")
+            # 尝试一个数据更全的备用接口 (Sina Rich)
+            try:
+                cls._spot_cache = ak.stock_zh_a_spot_sina()
+                cls._last_spot_time = current_time
+            except Exception as e2:
+                print(f"[Fetcher] Rich fallback failed: {e2}. Trying basic backup...")
+                try:
+                    cls._spot_cache = ak.stock_zh_a_spot()
+                    cls._last_spot_time = current_time
+                except Exception:
+                    # 如果都失败了，且本地有旧缓存，勉强用一下旧的
+                    if os.path.exists(cache_file):
+                        with open(cache_file, 'rb') as f:
+                            cls._spot_cache = pickle.load(f)
+                            return
+                    raise e
         
         # 静默保存到本地
         try:
@@ -98,76 +176,83 @@ class StockDataFetcher:
             print(f"Error fetching quotes: {e}")
             return pd.DataFrame()
 
-    @staticmethod
-    def get_kline_data(symbol: str, period: str = "daily", start_date: str = None, days: int = 200) -> pd.DataFrame:
-        """获取历史 K 线数据 (带重试机制)"""
+    @classmethod
+    def get_kline_data(cls, symbol: str, period: str = "daily", start_date: str = None, days: int = 200) -> pd.DataFrame:
+        """获取历史 K 线数据 (带重试机制与熔断保护)"""
         max_retries = 3
-        retry_delay = 2  # 初始延迟提升到 2 秒
+        retry_delay = 5 
+            
+        # 💡 统一代码格式：ak.stock_zh_a_hist 只要 6 位数字
+        clean_symbol = "".join(filter(str.isdigit, str(symbol)))
+                
+        if not cls._em_available:
+            return cls._fetch_fallback_kline(clean_symbol, start_date, days)
         
         for attempt in range(max_retries):
             try:
                 if not start_date:
                     start_date = (datetime.datetime.now() - datetime.timedelta(days=days)).strftime("%Y%m%d")
-                
-                # AKShare 接口有时不稳定，尝试捕获 RemoteDisconnected
-                df = ak.stock_zh_a_hist(symbol=symbol, period=period, start_date=start_date, adjust="qfq")
-                if df.empty:
-                    # print(f"[Fetcher] Warning: K-line data for {symbol} is empty.")
-                    pass
+                    
+                df = ak.stock_zh_a_hist(symbol=clean_symbol, period=period, start_date=start_date, adjust="qfq")
+                if df.empty: return pd.DataFrame()
                 return df
             except Exception as e:
                 error_msg = str(e)
-                # 🚨 检测到连接被拒绝，立即进入长时间等待
                 if 'Connection aborted' in error_msg or 'RemoteDisconnected' in error_msg:
-                    print(f"[Fetcher] ⚠️  Connection rejected for {symbol} (Attempt {attempt+1}/{max_retries}). Server may be rate-limiting. Waiting {retry_delay * 2}s...")
-                    time.sleep(retry_delay * 2)  # 双倍延迟
-                
-                # 尝试 Fallback 到 Sina 接口 (ak.stock_zh_a_daily)
-                if attempt == max_retries - 1: # Last attempt, try fallback
-                    try:
-                        # Sina 需要 sh/sz 前缀 (北交소通常是 bj，但Sina接口是否支持需验证。如果不支持，这里会返回空或报错)
-                        prefix = "sh" if symbol.startswith("6") else ("sz" if symbol.startswith(("0", "3")) else "bj")
-                        sina_symbol = f"{prefix}{symbol}" 
-                        
-                        # print(f"[Fetcher] Primary failed. Trying fallback (Sina) for {sina_symbol}...")
-                        df_sina = ak.stock_zh_a_daily(symbol=sina_symbol, start_date=start_date, adjust="qfq")
-                        
-                        if df_sina is not None and not df_sina.empty:
-                            # 检查是否存在 expected columns
-                            if "date" in df_sina.columns:
-                                # 重命名列以匹配 stock_zh_a_hist 格式
-                                df_sina = df_sina.rename(columns={
-                                    "date": "日期", "open": "开盘", "high": "最高", "low": "最低", 
-                                    "close": "收盘", "volume": "成交量", "amount": "成交额",
-                                    "turnover": "换手率"
-                                })
-                                # 计算涨跌幅 (Sina 不直接返回)
-                                if "收盘" in df_sina.columns:
-                                    df_sina['涨跌幅'] = df_sina['收盘'].pct_change() * 100
-                                    # 填充第一天的涨跌幅为0
-                                    df_sina['涨跌幅'] = df_sina['涨跌幅'].fillna(0)
-                                
-                                if "换手率" in df_sina.columns:
-                                    df_sina['换手率'] = df_sina['换手率'] * 100
-                                
-                                return df_sina
-                            else:
-                                pass
-                                # print(f"[Fetcher] Fallback (Sina) return unexpected columns for {symbol}: {df_sina.columns}")
-                    except Exception as ex:
-                        # 静默处理 Fallback 错误，避免刷屏
-                        # print(f"[Fetcher] Fallback (Sina) also failed for {symbol}: {ex}")
-                        pass
-
-                if attempt < max_retries - 1:
-                    print(f"[Fetcher] Error fetching K-line for {symbol} (Attempt {attempt+1}/{max_retries}): {e}. Retrying in {retry_delay}s...")
-                    time.sleep(retry_delay)
-                    retry_delay *= 2  # Exponential backoff
-                else:
-                    print(f"[Fetcher] Failed to fetch K-line for {symbol} after {max_retries} attempts & fallback: {e}")
-                    return pd.DataFrame()
+                    if attempt == 0 and not cls.probe_em_health():
+                        return cls._fetch_fallback_kline(clean_symbol, start_date, days)
+                    time.sleep(retry_delay * (attempt + 1))
+                if attempt == max_retries - 1:
+                    return cls._fetch_fallback_kline(clean_symbol, start_date, days)
         return pd.DataFrame()
+    
+    @classmethod
+    def _fetch_fallback_kline(cls, symbol, start_date, days=200):
+        """内部备选抓取逻辑 (优先 BaoStock, 次选 Sina)"""
+        # 1. 尝试使用 BaoStock
+        try:
+            raw_symbol = "".join(filter(str.isdigit, str(symbol)))
+            prefix = "sh" if raw_symbol.startswith("6") else "sz"
+            bs_symbol = f"{prefix}.{raw_symbol}"
+            
+            if not start_date:
+                start_date = (datetime.datetime.now() - datetime.timedelta(days=days)).strftime("%Y-%m-%d")
+            elif "-" not in str(start_date):
+                start_date = f"{str(start_date)[:4]}-{str(start_date)[4:6]}-{str(start_date)[6:]}"
+            
+            cls.ensure_bs_login()
+            rs = bs.query_history_k_data_plus(
+                bs_symbol, "date,open,high,low,close,volume,amount,turn,pctChg",
+                start_date=start_date, end_date=datetime.date.today().strftime("%Y-%m-%d"),
+                frequency="d", adjustflag="2"
+            )
+            
+            if rs.error_code == '0':
+                data_list = []
+                while rs.next(): data_list.append(rs.get_row_data())
+                if data_list:
+                    df = pd.DataFrame(data_list, columns=rs.fields)
+                    for col in ["open","high","low","close","volume","amount","turn","pctChg"]:
+                        df[col] = pd.to_numeric(df[col], errors='coerce')
+                    return df.rename(columns={
+                        "date":"日期","open":"开盘","high":"最高","low":"最低","close":"收盘",
+                        "volume":"成交量","amount":"成交额","turn":"换手率","pctChg":"涨跌幅"
+                    })
+        except Exception: pass
 
+        # 2. 尝试使用 Sina
+        try:
+            prefix = "sh" if str(symbol).startswith("6") else ("sz" if str(symbol).startswith(("0", "3")) else "bj")
+            df_sina = ak.stock_zh_a_daily(symbol=f"{prefix}{symbol}", start_date=str(start_date).replace("-",""), adjust="qfq")
+            if df_sina is not None and not df_sina.empty:
+                df_sina = df_sina.rename(columns={"date":"日期","open":"开盘","high":"最高","low":"最低","close":"收盘","volume":"成交量","amount":"成交额","turnover":"换手率"})
+                if "收盘" in df_sina.columns:
+                    df_sina['涨跌幅'] = df_sina['收盘'].pct_change() * 100
+                if "换手率" in df_sina.columns: df_sina['换手率'] = df_sina['换手率'] * 100
+                return df_sina
+        except Exception: pass
+        return pd.DataFrame()
+    
     @classmethod
     def get_company_finance(cls, symbol: str) -> List:
         """获取公司核心财务指标 (ROE, PE, PB, 营收, 净利润等)"""
